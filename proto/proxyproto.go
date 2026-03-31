@@ -1,4 +1,4 @@
-package main
+package proto
 
 import (
 	"encoding/binary"
@@ -8,9 +8,9 @@ import (
 	"strings"
 )
 
-// handleProxyProtocol 解析 HAProxy PROXY protocol v1/v2
+// HandleProxyProtocol 解析 HAProxy PROXY protocol v1/v2
 // 返回真实的客户端地址，出错返回 nil
-func handleProxyProtocol(reader streamReader, peer net.Addr) (net.Addr, error) {
+func HandleProxyProtocol(reader StreamReader, peer net.Addr) (net.Addr, error) {
 	const (
 		proxyMinLen  = 6
 		proxy2MinLen = 16
