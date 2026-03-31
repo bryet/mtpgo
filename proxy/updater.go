@@ -1,19 +1,40 @@
-package main
+package proxy
 
 import (
 	"crypto/tls"
-	"net"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"mtproxy/config"
+	"mtproxy/crypto"
 )
 
-var middleProxyMu sync.RWMutex
+// ── 日志 ──────────────────────────────────────────────────────────────────────
+
+var logWriter io.Writer
+
+func SetLogger(w io.Writer) {
+	logWriter = w
+}
+
+func Logf(format string, args ...interface{}) {
+	if logWriter != nil {
+		fmt.Fprintf(logWriter, format, args...)
+	}
+}
+
+func Dbgf(cfg *config.Config, format string, args ...interface{}) {
+	if cfg != nil && cfg.Debug {
+		Logf(format, args...)
+	}
+}
 
 // ── 中间代理列表更新 ──────────────────────────────────────────────────────────
 
@@ -43,7 +64,7 @@ func getNewProxies(url string) (map[int][][2]interface{}, error) {
 	return ans, nil
 }
 
-func updateMiddleProxyInfo(cfg *Config) {
+func UpdateMiddleProxyInfo(cfg *config.Config) {
 	const (
 		proxyInfoAddr   = "https://core.telegram.org/getProxyConfig"
 		proxyInfoAddrV6 = "https://core.telegram.org/getProxyConfigV6"
@@ -54,28 +75,28 @@ func updateMiddleProxyInfo(cfg *Config) {
 		// 更新 IPv4 代理列表
 		v4, err := getNewProxies(proxyInfoAddr)
 		if err != nil || len(v4) == 0 {
-			logf("Error updating middle proxy list:", err)
+			Logf("Error updating middle proxy list: %v\n", err)
 		} else {
-			middleProxyMu.Lock()
+			MiddleProxyMu.Lock()
 			TGMiddleProxiesV4 = v4
-			middleProxyMu.Unlock()
+			MiddleProxyMu.Unlock()
 		}
 
 		// 更新 IPv6 代理列表
 		v6, err := getNewProxies(proxyInfoAddrV6)
 		if err != nil || len(v6) == 0 {
-			logf("Error updating middle proxy list (IPv6):", err)
+			Logf("Error updating middle proxy list (IPv6): %v\n", err)
 		} else {
-			middleProxyMu.Lock()
+			MiddleProxyMu.Lock()
 			TGMiddleProxiesV6 = v6
-			middleProxyMu.Unlock()
+			MiddleProxyMu.Unlock()
 		}
 
 		// 更新 ProxySecret
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get(proxySecretAddr)
 		if err != nil {
-			logf("Error updating middle proxy secret:", err)
+			Logf("Error updating middle proxy secret: %v\n", err)
 		} else {
 			secret, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -84,7 +105,7 @@ func updateMiddleProxyInfo(cfg *Config) {
 				copy(newSecret, secret)
 				if string(newSecret) != string(ProxySecret) {
 					ProxySecret = newSecret
-					logf("Middle proxy secret updated\n")
+					Logf("Middle proxy secret updated\n")
 				}
 			}
 		}
@@ -95,10 +116,10 @@ func updateMiddleProxyInfo(cfg *Config) {
 
 // ── TLS 证书长度获取 ──────────────────────────────────────────────────────────
 
-var fakeCertLen = 2048 // 默认值
-var fakeCertMu sync.RWMutex
+var FakeCertLen = 2048 // 默认值
+var FakeCertMu sync.RWMutex
 
-func getMaskHostCertLen(cfg *Config) {
+func GetMaskHostCertLen(cfg *config.Config) {
 	const getCertTimeout = 10 * time.Second
 	const maskEnablingCheckPeriod = 60 * time.Second
 
@@ -119,7 +140,7 @@ func getMaskHostCertLen(cfg *Config) {
 				},
 			)
 			if err != nil {
-				logf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
+				Logf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
 				return
 			}
 			defer conn.Close()
@@ -127,21 +148,21 @@ func getMaskHostCertLen(cfg *Config) {
 			// 获取证书原始数据长度
 			state := conn.ConnectionState()
 			if len(state.PeerCertificates) == 0 {
-				logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
+				Logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
 				return
 			}
 			certLen := len(state.PeerCertificates[0].Raw)
 			if certLen < MinCertLen {
-				logf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
+				Logf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
 				return
 			}
 
-			fakeCertMu.Lock()
-			if certLen != fakeCertLen {
-				fakeCertLen = certLen
-				logf("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
+			FakeCertMu.Lock()
+			if certLen != FakeCertLen {
+				FakeCertLen = certLen
+				Logf("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
 			}
-			fakeCertMu.Unlock()
+			FakeCertMu.Unlock()
 		}()
 
 		time.Sleep(time.Duration(cfg.GetCertLenPeriod) * time.Second)
@@ -150,9 +171,9 @@ func getMaskHostCertLen(cfg *Config) {
 
 // ── IP 缓存清理 ───────────────────────────────────────────────────────────────
 
-func clearIPResolvingCache() {
+func ClearIPResolvingCache() {
 	for {
-		sleepTime := 60 + globalRand.Intn(60)
+		sleepTime := 60 + crypto.GlobalRand.Intn(60)
 		time.Sleep(time.Duration(sleepTime) * time.Second)
 		// 简单实现：重新获取一次 mask host IP（Go 的 net 包有内置 DNS 缓存处理）
 	}
