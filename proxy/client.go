@@ -110,13 +110,24 @@ func HandleClient(conn net.Conn, cfg *config.Config) {
 	stat.AddCurrConnects(1)
 	defer stat.AddCurrConnects(-1)
 
+	connectDirect := !cfg.UseMiddleProxy
+
 	var tgReader proto.StreamReader
 	var tgWriter proto.StreamWriter
 
-	clAddr := conn.RemoteAddr().(*net.TCPAddr)
-	Dbgf(cfg, "[DEBUG] connecting via middleproxy dc=%d\n", hsResult.DcIdx)
-	tgReader, tgWriter, err = DoMiddleproxyHandshake(hsResult.ProtoTag, hsResult.DcIdx,
-		clAddr.IP.String(), clAddr.Port, cfg)
+	if connectDirect {
+		var decKeyIV []byte
+		if cfg.FastMode {
+			decKeyIV = hsResult.EncKeyIV
+		}
+		Dbgf(cfg, "[DEBUG] connecting to TG dc=%d fastMode=%v\n", hsResult.DcIdx, cfg.FastMode)
+		tgReader, tgWriter, err = DoDirectHandshake(hsResult.ProtoTag, hsResult.DcIdx, decKeyIV, cfg)
+	} else {
+		clAddr := conn.RemoteAddr().(*net.TCPAddr)
+		Dbgf(cfg, "[DEBUG] connecting via middleproxy dc=%d\n", hsResult.DcIdx)
+		tgReader, tgWriter, err = DoMiddleproxyHandshake(hsResult.ProtoTag, hsResult.DcIdx,
+			clAddr.IP.String(), clAddr.Port, cfg)
+	}
 
 	if err != nil {
 		Dbgf(cfg, "[DEBUG] TG connect failed: %v\n", err)
@@ -128,15 +139,26 @@ func HandleClient(conn net.Conn, cfg *config.Config) {
 	cltReader := hsResult.Reader
 	cltWriter := hsResult.Writer
 
-	if bytes.Equal(hsResult.ProtoTag, proto.ProtoTagAbridged) {
-		cltReader = &proto.MtprotoCompactReader{Upstream: cltReader}
-		cltWriter = &proto.MtprotoCompactWriter{Upstream: cltWriter}
-	} else if bytes.Equal(hsResult.ProtoTag, proto.ProtoTagIntermediate) {
-		cltReader = &proto.MtprotoIntermediateReader{Upstream: cltReader}
-		cltWriter = &proto.MtprotoIntermediateWriter{Upstream: cltWriter}
-	} else if bytes.Equal(hsResult.ProtoTag, proto.ProtoTagSecure) {
-		cltReader = &proto.MtprotoSecureReader{Upstream: cltReader}
-		cltWriter = &proto.MtprotoSecureWriter{Upstream: cltWriter}
+	if connectDirect && cfg.FastMode {
+		if cr, ok := tgReader.(*proto.CryptoReader); ok {
+			cr.Decryptor = &noopCipher{}
+		}
+		if cw, ok := cltWriter.(*proto.CryptoWriter); ok {
+			cw.Encryptor = &noopCipher{}
+		}
+	}
+
+	if !connectDirect {
+		if bytes.Equal(hsResult.ProtoTag, proto.ProtoTagAbridged) {
+			cltReader = &proto.MtprotoCompactReader{Upstream: cltReader}
+			cltWriter = &proto.MtprotoCompactWriter{Upstream: cltWriter}
+		} else if bytes.Equal(hsResult.ProtoTag, proto.ProtoTagIntermediate) {
+			cltReader = &proto.MtprotoIntermediateReader{Upstream: cltReader}
+			cltWriter = &proto.MtprotoIntermediateWriter{Upstream: cltWriter}
+		} else if bytes.Equal(hsResult.ProtoTag, proto.ProtoTagSecure) {
+			cltReader = &proto.MtprotoSecureReader{Upstream: cltReader}
+			cltWriter = &proto.MtprotoSecureWriter{Upstream: cltWriter}
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -172,3 +194,8 @@ func SetKeepalive(conn net.Conn, interval int) {
 		tc.SetKeepAlivePeriod(time.Duration(interval) * time.Second)
 	}
 }
+
+type noopCipher struct{}
+
+func (n *noopCipher) Encrypt(data []byte) []byte { return data }
+func (n *noopCipher) Decrypt(data []byte) []byte { return data }
