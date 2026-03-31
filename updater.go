@@ -93,64 +93,6 @@ func updateMiddleProxyInfo(cfg *Config) {
 	}
 }
 
-// ── 服务器时间同步 ────────────────────────────────────────────────────────────
-
-var isTimeSkewed bool
-var timeSkewMu sync.RWMutex
-
-func getSrvTime(cfg *Config) {
-	const (
-		timeSyncAddr = "https://core.telegram.org/getProxySecret"
-		maxTimeSkew  = 30.0
-	)
-
-	wantReenable := false
-
-	for {
-		func() {
-			client := &http.Client{Timeout: 10 * time.Second}
-			resp, err := client.Get(timeSyncAddr)
-			if err != nil {
-				logf("Error getting server time:", err)
-				return
-			}
-			defer resp.Body.Close()
-
-			dateHeader := resp.Header.Get("Date")
-			if dateHeader == "" {
-				return
-			}
-
-			srvTime, err := time.Parse(time.RFC1123, dateHeader)
-			if err != nil {
-				logf("Error parsing server time:", err)
-				return
-			}
-
-			skew := time.Since(srvTime).Seconds()
-			skewed := skew > maxTimeSkew || skew < -maxTimeSkew
-
-			timeSkewMu.Lock()
-			isTimeSkewed = skewed
-			timeSkewMu.Unlock()
-
-			if skewed && cfg.UseMiddleProxy && !disableMiddleProxy {
-				logf("Time skew detected, please set the clock\n")
-				logf("Server time: %v, your time: %v\n", srvTime, time.Now().UTC())
-				logf("Disabling advertising to continue serving\n")
-				disableMiddleProxy = true
-				wantReenable = true
-			} else if !skewed && wantReenable {
-				logf("Time is ok, reenabling advertising\n")
-				disableMiddleProxy = false
-				wantReenable = false
-			}
-		}()
-
-		time.Sleep(time.Duration(cfg.GetTimePeriod) * time.Second)
-	}
-}
-
 // ── TLS 证书长度获取 ──────────────────────────────────────────────────────────
 
 var fakeCertLen = 2048 // 默认值
