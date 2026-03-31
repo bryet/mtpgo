@@ -50,7 +50,7 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
-          go build \
+          go build ./cmd/mtpgo/ \
             -trimpath \
             -ldflags "-s -w -buildid=" \
             -o mtpgo .
