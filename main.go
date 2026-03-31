@@ -141,9 +141,8 @@ func initIPInfo(cfg *Config) {
 	if ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "") {
 		logf("IPv6 found, using it for external communication\n")
 	}
-	if cfg.UseMiddleProxy && ipv4 == "" && ipv6 == "" {
-		logf("Failed to determine your ip, advertising disabled\n")
-		disableMiddleProxy = true
+	if ipv4 == "" && ipv6 == "" {
+		logf("Failed to determine your ip\n")
 	}
 }
 
@@ -297,12 +296,7 @@ func main() {
 	go getMaskHostCertLen(cfg)
 	go clearIPResolvingCache()
 
-	if cfg.UseMiddleProxy {
-		go updateMiddleProxyInfo(cfg)
-		if cfg.GetTimePeriod > 0 {
-			go getSrvTime(cfg)
-		}
-	}
+	go updateMiddleProxyInfo(cfg)
 
 	startMetricsServer(cfg, currentProxyLinks)
 
