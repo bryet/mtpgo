@@ -109,7 +109,8 @@ func initIPInfo(cfg *Config) {
 	iface := getNetIface()
 
 	ipv4 := getFirstIP([]string{
-		"https://ip.gs",
+		"https://ipinfo.io/ip",
+        "https://ip.gs",
 		"https://api.ipify.org",
 		"https://ip.sb",
 		"https://ifconfig.me",
@@ -118,7 +119,8 @@ func initIPInfo(cfg *Config) {
 		"http://ipv4.icanhazip.com/",
 	}, iface)
 	ipv6 := getFirstIP([]string{
-		"https://api64.ipify.org",
+		"https://ipinfo.io/ip",
+        "https://api64.ipify.org",
 		"http://v6.ident.me/",
 		"http://ipv6.icanhazip.com/",
 	}, iface)
