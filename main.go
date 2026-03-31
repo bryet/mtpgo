@@ -109,20 +109,21 @@ func initIPInfo(cfg *Config) {
 	iface := getNetIface()
 
 	ipv4 := getFirstIP([]string{
-		"https://ipinfo.io/ip",
-        "https://ip.gs",
-		"https://api.ipify.org",
-		"https://ip.sb",
-		"https://ifconfig.me",
-		"https://icanhazip.com",
-		"http://v4.ident.me/",
-		"http://ipv4.icanhazip.com/",
+		"ipinfo.io/ip",
+        "ip.gs",
+        "ip.sb",
+		"ident.me",
+        "ifconfig.me",
+		"api.ipify.org",
+		"ipv4.icanhazip.com",
 	}, iface)
 	ipv6 := getFirstIP([]string{
-		"https://ipinfo.io/ip",
-        "https://api64.ipify.org",
-		"http://v6.ident.me/",
-		"http://ipv6.icanhazip.com/",
+        "ip.gs",
+        "ip.sb",
+		"ident.me",
+        "ifconfig.me",
+        "api64.ipify.org",
+		"ipv6.icanhazip.com",
 	}, iface)
 	if ipv6 != "" && !strings.Contains(ipv6, ":") {
 		ipv6 = ""
