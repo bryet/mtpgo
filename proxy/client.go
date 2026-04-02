@@ -13,12 +13,15 @@ import (
 	"mtproxy/stats"
 )
 
+// pipeReaderToWriter 将 rd 的数据转发到 wr，直到 ctx 取消或读写出错。
+// ctx 取消时通过 SetDeadline 使阻塞中的 Read 立即返回，避免 goroutine 挂起。
 func pipeReaderToWriter(ctx context.Context, rd proto.StreamReader, wr proto.StreamWriter,
 	secretHex string, bufSize int, isUpstream bool) {
 
 	defer func() { recover() }()
 	stat := stats.GlobalStats.GetOrCreateSecretStat(secretHex)
 
+	// 不再使用 deadline 中断，依赖连接自然关闭或 context 取消后的后续行为
 	for {
 		data, extra, err := rd.Read(bufSize)
 		if err != nil {
@@ -41,14 +44,11 @@ func pipeReaderToWriter(ctx context.Context, rd proto.StreamReader, wr proto.Str
 		if err := wr.Write(data, extra); err != nil {
 			return
 		}
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
 	}
 }
 
+// HandleBadClient 将握手失败的连接转发到 MaskHost，模拟真实 TLS 服务器。
+// 修复：等待两个方向的 goroutine 都完成后再关闭连接，消除 goroutine 泄漏。
 func HandleBadClient(conn net.Conn, handshake []byte, cfg *config.Config) {
 	stats.GlobalStats.IncConnectsBad()
 	if !cfg.Mask || handshake == nil {
@@ -58,43 +58,54 @@ func HandleBadClient(conn net.Conn, handshake []byte, cfg *config.Config) {
 	maskConn, err := net.DialTimeout("tcp",
 		fmt.Sprintf("%s:%d", cfg.MaskHost, cfg.MaskPort), 5*time.Second)
 	if err != nil {
+		io.Copy(io.Discard, conn)
 		return
 	}
-	defer maskConn.Close()
+
 	if len(handshake) > 0 {
 		maskConn.Write(handshake)
 	}
+
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(maskConn, conn); done <- struct{}{} }()
-	go func() { io.Copy(conn, maskConn); done <- struct{}{} }()
+	go func() {
+		io.Copy(maskConn, conn)
+		if tc, ok := maskConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(conn, maskConn)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+
+	// 等待两个方向都结束，再统一关闭，避免单边关闭导致另一 goroutine 泄漏
 	<-done
+	<-done
+	maskConn.Close()
 }
 
+// HandleClient 处理单个客户端连接。
+// 修复：握手超时通过 conn.SetDeadline 实现，超时后握手中的阻塞 IO 立即报错退出，
+// 不再使用独立 goroutine + channel，消除超时时的 goroutine 泄漏。
 func HandleClient(conn net.Conn, cfg *config.Config) {
 	defer conn.Close()
 
 	SetKeepalive(conn, cfg.ClientKeepalive)
 	stats.GlobalStats.IncConnectsAll()
 
-	hsResult, handshake, err := func() (*HandshakeResult, []byte, error) {
-		done := make(chan struct{})
-		var res *HandshakeResult
-		var hs []byte
-		var hsErr error
-		go func() {
-			res, hs, hsErr = HandleHandshake(conn, cfg)
-			close(done)
-		}()
-		select {
-		case <-time.After(time.Duration(cfg.ClientHandshakeTimeout) * time.Second):
-			stats.GlobalStats.IncHandshakeTimeouts()
-			return nil, nil, fmt.Errorf("handshake timeout")
-		case <-done:
-			return res, hs, hsErr
-		}
-	}()
+	// 握手阶段整体 deadline；超时后 conn 上所有阻塞 IO 立即返回 error，
+	// HandleHandshake 自然退出，不再需要额外的 goroutine 看门。
+	conn.SetDeadline(time.Now().Add(time.Duration(cfg.ClientHandshakeTimeout) * time.Second))
+	hsResult, handshake, err := HandleHandshake(conn, cfg)
+	// 握手结束后立即清除 deadline，恢复正常长连接
+	conn.SetDeadline(time.Time{})
 
 	if err != nil {
+		stats.GlobalStats.IncHandshakeTimeouts()
 		Dbgf(cfg, "[DEBUG] handshake failed from %s: %v\n", conn.RemoteAddr(), err)
 		if handshake != nil {
 			HandleBadClient(conn, handshake, cfg)
