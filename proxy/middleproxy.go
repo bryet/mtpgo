@@ -55,6 +55,22 @@ var TGDatacentersV6 = []string{
 	"2001:67c:04e8:f004::a", "2001:b28:f23f:f005::a",
 }
 
+// TGDirectDCsMu 保护直连 DC 地址列表的并发读写
+var TGDirectDCsMu sync.RWMutex
+
+// GetDirectDC 线程安全地获取 DC 地址
+func GetDirectDC(idx int, preferV6 bool) (string, bool) {
+	TGDirectDCsMu.RLock()
+	defer TGDirectDCsMu.RUnlock()
+	if preferV6 && idx < len(TGDatacentersV6) {
+		return TGDatacentersV6[idx], true
+	}
+	if idx < len(TGDatacentersV4) {
+		return TGDatacentersV4[idx], true
+	}
+	return "", false
+}
+
 // 运行时会更新
 var TGMiddleProxiesV4 = map[int][][2]interface{}{
 	1: {{"149.154.175.50", 8888}}, -1: {{"149.154.175.50", 8888}},
@@ -250,17 +266,10 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 	dcIdx--
 
 	ipv4, ipv6 := MyIPInfo.Get()
-	var dc string
-	if ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "") {
-		if dcIdx < 0 || dcIdx >= len(TGDatacentersV6) {
-			return nil, nil, fmt.Errorf("invalid dc_idx %d for v6", dcIdx)
-		}
-		dc = TGDatacentersV6[dcIdx]
-	} else {
-		if dcIdx < 0 || dcIdx >= len(TGDatacentersV4) {
-			return nil, nil, fmt.Errorf("invalid dc_idx %d for v4", dcIdx)
-		}
-		dc = TGDatacentersV4[dcIdx]
+	preferV6 := ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "")
+	dc, ok := GetDirectDC(dcIdx, preferV6)
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid dc_idx %d (preferV6=%v)", dcIdx, preferV6)
 	}
 
 	addr := net.JoinHostPort(dc, fmt.Sprintf("%d", TGDatacenterPort))
@@ -406,27 +415,32 @@ func (r *proxyReqReader) ReadExactly(n int) ([]byte, error) {
 	return data, err
 }
 
+// 中间代理响应类型魔数，声明为包级变量避免每次调用重复分配
+var (
+	rpcProxyAns = [4]byte{0x0d, 0xda, 0x03, 0x44}
+	rpcCloseExt = [4]byte{0xa2, 0x34, 0xb6, 0x5e}
+	rpcSimpleAck = [4]byte{0x9b, 0x40, 0xac, 0x3b}
+	rpcUnknown  = [4]byte{0xdf, 0xa2, 0x30, 0x57}
+)
+
 func (r *proxyReqReader) Read(bufSize int) ([]byte, map[string]bool, error) {
-	rpcProxyAns := []byte{0x0d, 0xda, 0x03, 0x44}
-	rpcCloseExt := []byte{0xa2, 0x34, 0xb6, 0x5e}
-	rpcSimpleAck := []byte{0x9b, 0x40, 0xac, 0x3b}
-	rpcUnknown := []byte{0xdf, 0xa2, 0x30, 0x57}
 
 	data, _, err := r.upstream.Read(bufSize)
 	if err != nil || len(data) < 4 {
 		return nil, nil, err
 	}
-	ansType := data[:4]
-	if bytes.Equal(ansType, rpcCloseExt) {
+	var ansType [4]byte
+	copy(ansType[:], data[:4])
+	if ansType == rpcCloseExt {
 		return nil, nil, fmt.Errorf("remote closed")
 	}
-	if bytes.Equal(ansType, rpcProxyAns) {
+	if ansType == rpcProxyAns {
 		return data[16:], nil, nil
 	}
-	if bytes.Equal(ansType, rpcSimpleAck) {
+	if ansType == rpcSimpleAck {
 		return data[12:16], map[string]bool{"SIMPLE_ACK": true}, nil
 	}
-	if bytes.Equal(ansType, rpcUnknown) {
+	if ansType == rpcUnknown {
 		return nil, map[string]bool{"SKIP_SEND": true}, nil
 	}
 	return nil, map[string]bool{"SKIP_SEND": true}, nil
