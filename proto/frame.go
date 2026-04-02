@@ -81,26 +81,33 @@ type MtprotoFrameWriter struct {
 }
 
 func (w *MtprotoFrameWriter) Write(msg []byte, extra map[string]bool) error {
-	totalLen := len(msg) + 4 + 4 + 4
-	lenBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lenBytes, uint32(totalLen))
-	seqBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(seqBytes, uint32(w.SeqNo))
+	// 预计算总长度，一次性分配，避免多次 append 拷贝
+	// frame = len(4) + seq(4) + msg + crc32(4)，再对齐到 CBCPadding
+	baseLen := 4 + 4 + len(msg) + 4
+	padding := (CBCPadding - baseLen%CBCPadding) % CBCPadding
+	full := make([]byte, 0, baseLen+padding)
+
+	// len 字段包含整个帧（含自身），但不含 padding
+	totalLen := uint32(baseLen)
+	full = append(full,
+		byte(totalLen), byte(totalLen>>8), byte(totalLen>>16), byte(totalLen>>24))
+
+	seq := uint32(w.SeqNo)
 	w.SeqNo++
+	full = append(full,
+		byte(seq), byte(seq>>8), byte(seq>>16), byte(seq>>24))
 
-	withoutChecksum := append(append(lenBytes, seqBytes...), msg...)
-	checksum := crc32.ChecksumIEEE(withoutChecksum)
-	csBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(csBytes, checksum)
+	full = append(full, msg...)
 
-	full := append(withoutChecksum, csBytes...)
-	// padding
-	rem := len(full) % CBCPadding
-	if rem != 0 {
-		for i := 0; i < CBCPadding-rem; i += len(PaddingFiller) {
-			full = append(full, PaddingFiller...)
-		}
+	checksum := crc32.ChecksumIEEE(full) // 对 len+seq+msg 计算 CRC32
+	full = append(full,
+		byte(checksum), byte(checksum>>8), byte(checksum>>16), byte(checksum>>24))
+
+	// 补齐到 CBCPadding（16 字节）
+	for i := 0; i < padding; i += len(PaddingFiller) {
+		full = append(full, PaddingFiller...)
 	}
+
 	return w.Upstream.Write(full, extra)
 }
 
