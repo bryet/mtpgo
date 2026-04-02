@@ -52,6 +52,34 @@ func makeMetricsPkt(entries []metricEntry, prefix string) string {
 	return sb.String()
 }
 
+// ── IP 白名单（支持精确 IP 和 CIDR 两种格式）────────────────────────────────
+
+// ipAllowed 检查 clientIP 是否在白名单内。
+// 支持两种格式：
+//   - 精确 IP：如 "127.0.0.1"、"::1"
+//   - CIDR 网段：如 "127.0.0.0/8"、"10.0.0.0/8"、"::1/128"
+func ipAllowed(clientIP string, whitelist []string) bool {
+	parsed := net.ParseIP(clientIP)
+	if parsed == nil {
+		return false
+	}
+	for _, entry := range whitelist {
+		if strings.Contains(entry, "/") {
+			// CIDR 匹配
+			_, network, err := net.ParseCIDR(entry)
+			if err == nil && network.Contains(parsed) {
+				return true
+			}
+		} else {
+			// 精确 IP 匹配
+			if entry == clientIP {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ── metrics handler ───────────────────────────────────────────────────────────
 
 func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.HandlerFunc {
@@ -61,15 +89,8 @@ func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.Han
 			clientIP = host
 		}
 
-		// 白名单检查
-		allowed := false
-		for _, ip := range cfg.MetricsWhitelist {
-			if ip == clientIP {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
+		// 白名单检查（支持精确 IP 和 CIDR）
+		if !ipAllowed(clientIP, cfg.MetricsWhitelist) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -172,6 +193,9 @@ func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.Han
 	}
 }
 
+// StartMetricsServer 启动 Prometheus metrics HTTP 服务器。
+// 修复：设置 ReadTimeout / WriteTimeout / IdleTimeout，防止慢速客户端
+// 长期占用连接耗尽服务器资源。
 func StartMetricsServer(cfg *config.Config, proxyLinks []map[string]string) {
 	if cfg.MetricsPort == 0 {
 		return
@@ -180,11 +204,20 @@ func StartMetricsServer(cfg *config.Config, proxyLinks []map[string]string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", MetricsHandler(cfg, proxyLinks))
 
+	newServer := func(addr string) *http.Server {
+		return &http.Server{
+			Addr:         addr,
+			Handler:      mux,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  30 * time.Second,
+		}
+	}
+
 	if cfg.MetricsListenAddrV4 != "" {
 		addr := fmt.Sprintf("%s:%d", cfg.MetricsListenAddrV4, cfg.MetricsPort)
 		go func() {
-			srv := &http.Server{Addr: addr, Handler: mux}
-			if err := srv.ListenAndServe(); err != nil {
+			if err := newServer(addr).ListenAndServe(); err != nil {
 				fmt.Printf("Metrics server error: %v\n", err)
 			}
 		}()
@@ -193,8 +226,7 @@ func StartMetricsServer(cfg *config.Config, proxyLinks []map[string]string) {
 	if cfg.MetricsListenAddrV6 != "" {
 		addr := fmt.Sprintf("[%s]:%d", cfg.MetricsListenAddrV6, cfg.MetricsPort)
 		go func() {
-			srv := &http.Server{Addr: addr, Handler: mux}
-			if err := srv.ListenAndServe(); err != nil {
+			if err := newServer(addr).ListenAndServe(); err != nil {
 				fmt.Printf("Metrics server (v6) error: %v\n", err)
 			}
 		}()
