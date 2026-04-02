@@ -133,7 +133,9 @@ func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter
 
 	frameW := &proto.MtprotoFrameWriter{Upstream: w, SeqNo: startSeqNo}
 
-	keySelector := ProxySecret[:4]
+	// 线程安全地读取 ProxySecret（写操作在 updater.go 中通过 setProxySecret 加锁）
+	proxySecret := GetProxySecret()
+	keySelector := proxySecret[:4]
 	cryptoTS := make([]byte, 4)
 	binary.LittleEndian.PutUint32(cryptoTS, uint32(time.Now().Unix()))
 
@@ -192,9 +194,9 @@ func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter
 	}
 
 	encKey, encIV := getMiddleproxyAESKeyIV(rpcNonceAns, nonce, cryptoTS, tgIPBytes, myPortBytes,
-		[]byte("CLIENT"), myIPBytes, tgPortBytes, ProxySecret, myIPv6Bytes, tgIPv6Bytes)
+		[]byte("CLIENT"), myIPBytes, tgPortBytes, proxySecret, myIPv6Bytes, tgIPv6Bytes)
 	decKey, decIV := getMiddleproxyAESKeyIV(rpcNonceAns, nonce, cryptoTS, tgIPBytes, myPortBytes,
-		[]byte("SERVER"), myIPBytes, tgPortBytes, ProxySecret, myIPv6Bytes, tgIPv6Bytes)
+		[]byte("SERVER"), myIPBytes, tgPortBytes, proxySecret, myIPv6Bytes, tgIPv6Bytes)
 
 	encryptor := crypto.NewAESCBC(encKey, encIV)
 	decryptor := crypto.NewAESCBC(decKey, decIV)
@@ -332,6 +334,12 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 		return nil, nil, err
 	}
 
+	// 设置读超时，防止 DC 无响应时连接永久挂起占用 goroutine 和 fd
+	readTimeout := time.Duration(cfg.TGReadTimeout) * time.Second
+	conn.SetDeadline(time.Now().Add(readTimeout))
+	// 连接交给上层使用后，由上层的 context 取消机制（SetDeadline）控制生命周期，
+	// 此处不再重置 deadline，上层 pipeReaderToWriter 会在 ctx 取消时调用 SetDeadline。
+
 	r := &proto.TCPReader{Conn: conn}
 	w := &proto.TCPWriter{Conn: conn}
 	return &proto.CryptoReader{Upstream: r, Decryptor: decryptor, BlockSize: 1},
@@ -339,44 +347,54 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 }
 
 // ── 中间代理出站 ──────────────────────────────────────────────────────────────
+// DoMiddleproxyHandshake 通过中间代理节点建立到 Telegram DC 的连接。
+// 修复：读取代理列表时加 RLock，防止与 UpdateMiddleProxyInfo 的写操作数据竞争。
 func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int, cfg *config.Config) (proto.StreamReader, proto.StreamWriter, error) {
-    ipv4, ipv6 := MyIPInfo.Get()
-    useIPv6 := ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "")
+	ipv4, ipv6 := MyIPInfo.Get()
+	useIPv6 := ipv6 != "" && (cfg.PreferIPv6 || ipv4 == "")
 
-    var proxies [][2]interface{}
-    if useIPv6 {
-        p, ok := TGMiddleProxiesV6[dcIdx]
-        if !ok {
-            return nil, nil, fmt.Errorf("no v6 proxy for dc %d", dcIdx)
-        }
-        proxies = p
-    } else {
-        p, ok := TGMiddleProxiesV4[dcIdx]
-        if !ok {
-            return nil, nil, fmt.Errorf("no v4 proxy for dc %d", dcIdx)
-        }
-        proxies = p
-    }
+	// 读取代理列表时加读锁，防止与 UpdateMiddleProxyInfo 并发写操作产生数据竞争
+	MiddleProxyMu.RLock()
+	var proxies [][2]interface{}
+	var ok bool
+	if useIPv6 {
+		proxies, ok = TGMiddleProxiesV6[dcIdx]
+	} else {
+		proxies, ok = TGMiddleProxiesV4[dcIdx]
+	}
+	// 在 Intn 之前复制一份，避免持锁时间过长
+	chosen := [2]interface{}{"", 0}
+	if ok && len(proxies) > 0 {
+		chosen = proxies[crypto.GlobalRand.Intn(len(proxies))]
+	}
+	MiddleProxyMu.RUnlock()
 
-    chosen := proxies[crypto.GlobalRand.Intn(len(proxies))]
-    host := chosen[0].(string)
-    port := chosen[1].(int)
+	if !ok {
+		proto := "v4"
+		if useIPv6 {
+			proto = "v6"
+		}
+		return nil, nil, fmt.Errorf("no %s proxy for dc %d", proto, dcIdx)
+	}
 
-    conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
-    if err != nil {
-        return nil, nil, err
-    }
+	host := chosen[0].(string)
+	port := chosen[1].(int)
 
-    frameR, frameW, myIP, myPort, err := middleproxyHandshake(conn)
-    if err != nil {
-        conn.Close()
-        return nil, nil, err
-    }
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
 
-    proxyR := &proxyReqReader{upstream: frameR}
-    proxyW := newProxyReqWriter(frameW, clIP, clPort, myIP, myPort, protoTag, cfg)
+	frameR, frameW, myIP, myPort, err := middleproxyHandshake(conn)
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
 
-    return proxyR, proxyW, nil
+	proxyR := &proxyReqReader{upstream: frameR}
+	proxyW := newProxyReqWriter(frameW, clIP, clPort, myIP, myPort, protoTag, cfg)
+
+	return proxyR, proxyW, nil
 }
 
 // ── ProxyReq 流（包装中间代理协议）────────────────────────────────────────────
@@ -439,13 +457,18 @@ func newProxyReqWriter(upstream proto.StreamWriter, clIP string, clPort int,
 	}
 }
 
+// encodeIPPort 将 IP:port 编码为 MTProto 中间代理协议所需的格式：
+//   IPv4：[0×10 零字节][0xff][0xff][4字节IPv4][4字节端口] = 16 字节
+//         前 10 字节为零是 IPv4-mapped IPv6 地址的标准前缀（RFC 4291 §2.5.5.2）
+//   IPv6：[16字节IPv6][4字节端口] = 20 字节
 func encodeIPPort(ip string, port int) []byte {
 	parsed := net.ParseIP(ip)
 	portBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(portBytes, uint32(port))
 
 	if parsed.To4() != nil {
-		out := make([]byte, 10, 20)
+		// IPv4-mapped IPv6：10 字节零前缀 + 0xFFFF + 4 字节 IPv4
+		out := make([]byte, 10, 20) // 10 个零字节
 		out = append(out, 0xff, 0xff)
 		out = append(out, parsed.To4()...)
 		out = append(out, portBytes...)
