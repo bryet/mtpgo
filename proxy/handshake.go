@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -543,24 +542,31 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 			continue
 		}
 
-		fakeCertLen := rand.Intn(4096-1024) + 1024
+		// 修复：使用 crypto.GlobalRand 替代 math/rand，保持随机源一致
+		fakeCertLen := crypto.GlobalRand.Intn(4096-1024) + 1024
 		httpData := crypto.GlobalRand.Bytes(fakeCertLen)
 
-		srvHello := append(tlsVers, make([]byte, digestLen)...)
+		// 预计算 srvHello 总长度，一次性分配，避免多次 append 导致的重复内存拷贝
+		// srvHello = tlsVers(2) + digest(32) + sessIDLen(1) + sessID + ciphersuite(2) + comp(1) + extensions
+		srvHelloSize := 2 + digestLen + 1 + sessIDLen + 2 + 1 + len(tlsExtensions)
+		srvHello := make([]byte, 0, srvHelloSize)
+		srvHello = append(srvHello, tlsVers...)
+		srvHello = append(srvHello, make([]byte, digestLen)...)
 		srvHello = append(srvHello, byte(sessIDLen))
 		srvHello = append(srvHello, sessID...)
 		srvHello = append(srvHello, tlsCiphersuite...)
 		srvHello = append(srvHello, 0x00)
 		srvHello = append(srvHello, tlsExtensions...)
 
-		srvHelloInnerLen := make([]byte, 3)
-		srvHelloInnerLen[0] = byte(len(srvHello) >> 16)
-		srvHelloInnerLen[1] = byte(len(srvHello) >> 8)
-		srvHelloInnerLen[2] = byte(len(srvHello))
-		outerLen := len(srvHello) + 4
-		helloPkt := []byte{0x16, 0x03, 0x03, byte(outerLen >> 8), byte(outerLen)}
+		// 预计算 helloPkt 总长度，一次性分配
+		// helloPkt = recordHdr(5) + handshakeType(1) + innerLen(3) + srvHello + changeCipher(6) + appHdr(3) + dataLen(2) + httpData
+		srvHelloInnerLen := len(srvHello)
+		outerLen := srvHelloInnerLen + 4
+		helloPktSize := 5 + 1 + 3 + len(srvHello) + len(tlsChangeCipher) + len(tlsAppHTTP2Hdr) + 2 + len(httpData)
+		helloPkt := make([]byte, 0, helloPktSize)
+		helloPkt = append(helloPkt, 0x16, 0x03, 0x03, byte(outerLen>>8), byte(outerLen))
 		helloPkt = append(helloPkt, 0x02)
-		helloPkt = append(helloPkt, srvHelloInnerLen...)
+		helloPkt = append(helloPkt, byte(srvHelloInnerLen>>16), byte(srvHelloInnerLen>>8), byte(srvHelloInnerLen))
 		helloPkt = append(helloPkt, srvHello...)
 		helloPkt = append(helloPkt, tlsChangeCipher...)
 		helloPkt = append(helloPkt, tlsAppHTTP2Hdr...)
