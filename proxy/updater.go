@@ -16,6 +16,8 @@ import (
 	"mtproxy/crypto"
 )
 
+const MinCertLen = 1024
+
 // proxySecretMu 保护 ProxySecret 的并发读写。
 // ProxySecret 在 middleproxyHandshake（高频读）和 UpdateMiddleProxyInfo（低频写）
 // 中并发访问，必须加锁。
@@ -59,7 +61,7 @@ func Dbgf(cfg *config.Config, format string, args ...interface{}) {
 
 // ── 中间代理列表更新 ──────────────────────────────────────────────────────────
 
-func getNewProxies(url string) (map[int][][2]interface{}, error) {
+func getNewProxies(url string) (map[int][]DCAddr, error) {
 	re := regexp.MustCompile(`proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;`)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
@@ -72,7 +74,7 @@ func getNewProxies(url string) (map[int][][2]interface{}, error) {
 		return nil, err
 	}
 
-	ans := make(map[int][][2]interface{})
+	ans := make(map[int][]DCAddr)
 	for _, match := range re.FindAllStringSubmatch(string(body), -1) {
 		dcIdx, _ := strconv.Atoi(match[1])
 		host := match[2]
@@ -80,7 +82,7 @@ func getNewProxies(url string) (map[int][][2]interface{}, error) {
 		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 			host = host[1 : len(host)-1]
 		}
-		ans[dcIdx] = append(ans[dcIdx], [2]interface{}{host, port})
+		ans[dcIdx] = append(ans[dcIdx], DCAddr{Host: host, Port: port})
 	}
 	return ans, nil
 }
@@ -192,6 +194,60 @@ func UpdateMiddleProxyInfo(cfg *config.Config) {
 	}
 }
 
+// UpdateMiddleProxyInfoAtomic 是 UpdateMiddleProxyInfo 的 AtomicConfig 版本。
+// 每次循环迭代时通过 atomicCfg.Get() 取得最新配置，热重载后自动使用新的更新周期。
+func UpdateMiddleProxyInfoAtomic(atomicCfg *config.AtomicConfig) {
+	const (
+		proxyInfoAddr   = "https://core.telegram.org/getProxyConfig"
+		proxyInfoAddrV6 = "https://core.telegram.org/getProxyConfigV6"
+		proxySecretAddr = "https://core.telegram.org/getProxySecret"
+	)
+
+	for {
+		v4, err := getNewProxies(proxyInfoAddr)
+		if err != nil || len(v4) == 0 {
+			Logf("Error updating middle proxy list: %v\n", err)
+		} else {
+			MiddleProxyMu.Lock()
+			TGMiddleProxiesV4 = v4
+			MiddleProxyMu.Unlock()
+		}
+
+		v6, err := getNewProxies(proxyInfoAddrV6)
+		if err != nil || len(v6) == 0 {
+			Logf("Error updating middle proxy list (IPv6): %v\n", err)
+		} else {
+			MiddleProxyMu.Lock()
+			TGMiddleProxiesV6 = v6
+			MiddleProxyMu.Unlock()
+		}
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(proxySecretAddr)
+		if err != nil {
+			Logf("Error updating middle proxy secret: %v\n", err)
+		} else {
+			secret, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(secret) > 0 {
+				newSecret := make([]byte, len(secret))
+				copy(newSecret, secret)
+				current := GetProxySecret()
+				if string(newSecret) != string(current) {
+					setProxySecret(newSecret)
+					Logf("Middle proxy secret updated\n")
+				}
+			}
+		}
+
+		UpdateDirectDCAddrs()
+
+		// 每次循环末尾重新 Get()，热重载后使用新的 ProxyInfoUpdatePeriod
+		cfg := atomicCfg.Get()
+		time.Sleep(time.Duration(cfg.ProxyInfoUpdatePeriod) * time.Second)
+	}
+}
+
 // ── TLS 证书长度获取 ──────────────────────────────────────────────────────────
 
 var FakeCertLen = 2048 // 默认值
@@ -224,6 +280,58 @@ func GetMaskHostCertLen(cfg *config.Config) {
 			defer conn.Close()
 
 			// 获取证书原始数据长度
+			state := conn.ConnectionState()
+			if len(state.PeerCertificates) == 0 {
+				Logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
+				return
+			}
+			certLen := len(state.PeerCertificates[0].Raw)
+			if certLen < MinCertLen {
+				Logf("MASK_HOST %s cert too short: %d\n", cfg.MaskHost, certLen)
+				return
+			}
+
+			FakeCertMu.Lock()
+			if certLen != FakeCertLen {
+				FakeCertLen = certLen
+				Logf("Got cert from MASK_HOST %s, length: %d\n", cfg.MaskHost, certLen)
+			}
+			FakeCertMu.Unlock()
+		}()
+
+		time.Sleep(time.Duration(cfg.GetCertLenPeriod) * time.Second)
+	}
+}
+
+// GetMaskHostCertLenAtomic 是 GetMaskHostCertLen 的 AtomicConfig 版本。
+// 每次循环迭代时通过 atomicCfg.Get() 取得最新配置，热重载后 MaskHost/TLSDomain 立即生效。
+func GetMaskHostCertLenAtomic(atomicCfg *config.AtomicConfig) {
+	const getCertTimeout = 10 * time.Second
+	const maskEnablingCheckPeriod = 60 * time.Second
+
+	for {
+		cfg := atomicCfg.Get()
+		if !cfg.Mask {
+			time.Sleep(maskEnablingCheckPeriod)
+			continue
+		}
+
+		func() {
+			conn, err := tls.DialWithDialer(
+				&net.Dialer{Timeout: getCertTimeout},
+				"tcp",
+				fmt.Sprintf("%s:%d", cfg.MaskHost, cfg.MaskPort),
+				&tls.Config{
+					ServerName:         cfg.TLSDomain,
+					InsecureSkipVerify: true,
+				},
+			)
+			if err != nil {
+				Logf("Failed to connect to MASK_HOST %s: %v\n", cfg.MaskHost, err)
+				return
+			}
+			defer conn.Close()
+
 			state := conn.ConnectionState()
 			if len(state.PeerCertificates) == 0 {
 				Logf("MASK_HOST %s returned no certificates\n", cfg.MaskHost)
