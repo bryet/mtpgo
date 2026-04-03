@@ -41,8 +41,13 @@ func (i *IPInfo) Get() (string, string) {
 
 // ── 常量 ──────────────────────────────────────────────────────────────────────
 
-const MinCertLen = 1024
+// DCAddr 是单个代理/DC 节点的地址，替代原先类型不安全的 [2]interface{}。
+type DCAddr struct {
+	Host string
+	Port int
+}
 
+// TGDatacenterPort DC 直连端口
 const TGDatacenterPort = 443
 
 var TGDatacentersV4 = []string{
@@ -72,7 +77,7 @@ func GetDirectDC(idx int, preferV6 bool) (string, bool) {
 }
 
 // 运行时会更新
-var TGMiddleProxiesV4 = map[int][][2]interface{}{
+var TGMiddleProxiesV4 = map[int][]DCAddr{
 	1: {{"149.154.175.50", 8888}}, -1: {{"149.154.175.50", 8888}},
 	2: {{"149.154.161.144", 8888}}, -2: {{"149.154.161.144", 8888}},
 	3: {{"149.154.175.100", 8888}}, -3: {{"149.154.175.100", 8888}},
@@ -80,7 +85,7 @@ var TGMiddleProxiesV4 = map[int][][2]interface{}{
 	5: {{"91.108.56.183", 8888}}, -5: {{"91.108.56.183", 8888}},
 }
 
-var TGMiddleProxiesV6 = map[int][][2]interface{}{
+var TGMiddleProxiesV6 = map[int][]DCAddr{
 	1: {{"2001:b28:f23d:f001::d", 8888}}, -1: {{"2001:b28:f23d:f001::d", 8888}},
 	2: {{"2001:67c:04e8:f002::d", 80}}, -2: {{"2001:67c:04e8:f002::d", 80}},
 	3: {{"2001:b28:f23d:f003::d", 8888}}, -3: {{"2001:b28:f23d:f003::d", 8888}},
@@ -364,7 +369,7 @@ func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int,
 
 	// 读取代理列表时加读锁，防止与 UpdateMiddleProxyInfo 并发写操作产生数据竞争
 	MiddleProxyMu.RLock()
-	var proxies [][2]interface{}
+	var proxies []DCAddr
 	var ok bool
 	if useIPv6 {
 		proxies, ok = TGMiddleProxiesV6[dcIdx]
@@ -372,7 +377,7 @@ func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int,
 		proxies, ok = TGMiddleProxiesV4[dcIdx]
 	}
 	// 在 Intn 之前复制一份，避免持锁时间过长
-	chosen := [2]interface{}{"", 0}
+	chosen := DCAddr{}
 	if ok && len(proxies) > 0 {
 		chosen = proxies[crypto.GlobalRand.Intn(len(proxies))]
 	}
@@ -386,8 +391,8 @@ func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int,
 		return nil, nil, fmt.Errorf("no %s proxy for dc %d", proto, dcIdx)
 	}
 
-	host := chosen[0].(string)
-	port := chosen[1].(int)
+	host := chosen.Host
+	port := chosen.Port
 
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
 	if err != nil {
