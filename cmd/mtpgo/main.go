@@ -213,7 +213,11 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 
 // ── 服务器启动 ────────────────────────────────────────────────────────────────
 
-func startServers(cfg *config.Config) []io.Closer {
+// startServers 启动所有监听器并返回它们的 Closer 列表。
+// 接受 *config.AtomicConfig 而非裸 *config.Config，确保 acceptLoop 中的每个连接
+// 都能通过 atomicCfg.Get() 拿到最新配置快照，热重载后新连接立即使用新配置。
+func startServers(atomicCfg *config.AtomicConfig) []io.Closer {
+	cfg := atomicCfg.Get()
 	var listeners []io.Closer
 
 	if cfg.ListenAddrIPv4 != "" {
@@ -224,7 +228,7 @@ func startServers(cfg *config.Config) []io.Closer {
 		} else {
 			logf("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, cfg)
+			go acceptLoop(ln, atomicCfg)
 		}
 	}
 
@@ -236,7 +240,7 @@ func startServers(cfg *config.Config) []io.Closer {
 		} else {
 			logf("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, cfg)
+			go acceptLoop(ln, atomicCfg)
 		}
 	}
 
@@ -247,20 +251,25 @@ func startServers(cfg *config.Config) []io.Closer {
 			logf("Failed to listen on unix %s: %v\n", cfg.ListenUnixSock, err)
 		} else {
 			listeners = append(listeners, ln)
-			go acceptLoop(ln, cfg)
+			go acceptLoop(ln, atomicCfg)
 		}
 	}
 
 	return listeners
 }
 
-func acceptLoop(ln net.Listener, cfg *config.Config) {
+// acceptLoop 持续接受新连接，每次连接时通过 atomicCfg.Get() 取得当前配置快照。
+// 这样热重载后新建立的连接会使用新配置，已有连接不受影响（符合预期语义）。
+func acceptLoop(ln net.Listener, atomicCfg *config.AtomicConfig) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go proxy.HandleClientWrapper(conn, cfg)
+		// 每次 Accept 后取一次配置快照，传给 HandleClientWrapper。
+		// HandleClientWrapper 内部是单次连接的完整生命周期，使用快照即可，
+		// 无需在连接过程中感知配置变更。
+		go proxy.HandleClientWrapper(conn, atomicCfg.Get())
 	}
 }
 
@@ -278,24 +287,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 用 AtomicConfig 统一管理配置，所有 goroutine 通过它读写，保证热重载的并发安全。
+	atomicCfg := config.NewAtomicConfig(cfg)
+
 	proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
 	proxy.ClientIPs = proxy.NewReplayCache(cfg.ClientIPsLen)
 
 	initIPInfo(cfg)
-	proxy.SetMaskHost(cfg.MaskHost) // 初始化 DNS 缓存刷新所需的 MaskHost
+	proxy.SetMaskHost(cfg.MaskHost)
 	currentProxyLinks := printTGInfo(cfg)
 
-	go stats.StatsPrinter(cfg, logf)
-	go proxy.GetMaskHostCertLen(cfg)
+	// 后台 goroutine 传入 atomicCfg，内部通过 Get() 读取最新配置。
+	// StatsPrinter / GetMaskHostCertLen / UpdateMiddleProxyInfo 都是长期循环，
+	// 热重载后它们在下一次循环迭代时会自动拿到新配置。
+	go stats.StatsPrinterAtomic(atomicCfg, logf)
+	go proxy.GetMaskHostCertLenAtomic(atomicCfg)
 	go proxy.ClearIPResolvingCache()
 
 	if cfg.UseMiddleProxy {
-		go proxy.UpdateMiddleProxyInfo(cfg)
+		go proxy.UpdateMiddleProxyInfoAtomic(atomicCfg)
 	}
 
-	stats.StartMetricsServer(cfg, currentProxyLinks)
+	stats.StartMetricsServerAtomic(atomicCfg, currentProxyLinks)
 
-	listeners := startServers(cfg)
+	listeners := startServers(atomicCfg)
 	if len(listeners) == 0 {
 		logf("没有可用的监听地址，退出\n")
 		os.Exit(1)
@@ -310,10 +325,12 @@ func main() {
 				logf("配置重载失败: %v\n", err)
 				continue
 			}
-			*cfg = *newCfg
-			proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
-			proxy.SetMaskHost(cfg.MaskHost)
-			currentProxyLinks = printTGInfo(cfg)
+			// Set 内部用写锁原子替换指针，不存在半更新状态。
+			atomicCfg.Set(newCfg)
+			// 重置 ReplayCache（新配置可能改变了 ReplayCheckLen）
+			proxy.UsedHandshakes = proxy.NewReplayCache(newCfg.ReplayCheckLen)
+			proxy.SetMaskHost(newCfg.MaskHost)
+			currentProxyLinks = printTGInfo(newCfg)
 			logf("Config reloaded\n")
 		}
 	}()
