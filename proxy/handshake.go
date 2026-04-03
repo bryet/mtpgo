@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -227,30 +228,35 @@ func parseClientHelloJA3(hello []byte) (string, error) {
 }
 
 func buildJA3(h *tlsHello) string {
-	join16 := func(vals []uint16) string {
-		if len(vals) == 0 {
-			return ""
+	// 使用 strings.Builder 避免 O(n²) 字符串拼接
+	join16 := func(b *strings.Builder, vals []uint16) {
+		for i, v := range vals {
+			if i > 0 {
+				b.WriteByte('-')
+			}
+			fmt.Fprintf(b, "%d", v)
 		}
-		s := fmt.Sprintf("%d", vals[0])
-		for _, v := range vals[1:] {
-			s += fmt.Sprintf("-%d", v)
-		}
-		return s
 	}
-	joinB := func(vals []byte) string {
-		if len(vals) == 0 {
-			return ""
+	joinB := func(b *strings.Builder, vals []byte) {
+		for i, v := range vals {
+			if i > 0 {
+				b.WriteByte('-')
+			}
+			fmt.Fprintf(b, "%d", v)
 		}
-		s := fmt.Sprintf("%d", vals[0])
-		for _, v := range vals[1:] {
-			s += fmt.Sprintf("-%d", v)
-		}
-		return s
 	}
-	raw := fmt.Sprintf("%d,%s,%s,%s,%s",
-		h.legacyVer, join16(h.ciphers), join16(h.extTypes),
-		join16(h.curves), joinB(h.pointFmts))
-	sum := sha256.Sum256([]byte(raw))
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d,", h.legacyVer)
+	join16(&b, h.ciphers)
+	b.WriteByte(',')
+	join16(&b, h.extTypes)
+	b.WriteByte(',')
+	join16(&b, h.curves)
+	b.WriteByte(',')
+	joinB(&b, h.pointFmts)
+
+	sum := sha256.Sum256([]byte(b.String()))
 	return fmt.Sprintf("%x", sum[:16])
 }
 
@@ -409,16 +415,29 @@ func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 }
 
 // ── Replay 防护 ───────────────────────────────────────────────────────────────
+//
+// replayCache 使用定长环形队列（ring buffer）跟踪最近插入的键，
+// 避免原先 order[1:] 截取导致底层数组永不释放的内存泄漏。
+// 环形队列预分配 maxLen 个槽位，写满后覆盖最旧的条目，无需任何内存重分配。
 
 type replayCache struct {
 	mu     sync.Mutex
 	cache  map[string]bool
-	order  []string
+	ring   []string // 定长环形缓冲区，容量 = maxLen
+	head   int      // 下一个写入位置（覆盖最旧条目）
+	count  int      // 当前已存条目数
 	maxLen int
 }
 
 func NewReplayCache(maxLen int) *replayCache {
-	return &replayCache{cache: make(map[string]bool), maxLen: maxLen}
+	if maxLen <= 0 {
+		maxLen = 0
+	}
+	return &replayCache{
+		cache:  make(map[string]bool, maxLen),
+		ring:   make([]string, maxLen),
+		maxLen: maxLen,
+	}
 }
 
 func (rc *replayCache) Has(key []byte) bool {
@@ -428,16 +447,22 @@ func (rc *replayCache) Has(key []byte) bool {
 }
 
 func (rc *replayCache) Add(key []byte) {
+	if rc.maxLen <= 0 {
+		return
+	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	if rc.maxLen > 0 && len(rc.order) >= rc.maxLen {
-		oldest := rc.order[0]
-		rc.order = rc.order[1:]
-		delete(rc.cache, oldest)
-	}
 	k := string(key)
+	if rc.count == rc.maxLen {
+		// 环形队列已满，覆盖最旧条目
+		oldest := rc.ring[rc.head]
+		delete(rc.cache, oldest)
+		rc.count--
+	}
+	rc.ring[rc.head] = k
+	rc.head = (rc.head + 1) % rc.maxLen
 	rc.cache[k] = true
-	rc.order = append(rc.order, k)
+	rc.count++
 }
 
 var UsedHandshakes *replayCache
