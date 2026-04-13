@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -189,11 +188,12 @@ func parseClientHello(hello []byte) (*tlsHello, error) {
 				}
 			}
 		case 0x0010: // application_layer_protocol_negotiation
-			// list_len(2) + first_proto: proto_len(2) + proto_bytes
-			if len(extData) >= 4 {
-				protoLen := int(binary.BigEndian.Uint16(extData[2:]))
-				if 4+protoLen <= len(extData) {
-					h.alpn = string(extData[4 : 4+protoLen])
+			// ALPN 格式：list_len(2) + proto_len(1) + proto_bytes
+			// proto_len 是 1 字节，不是 2 字节（修复之前用 Uint16 读了 2 字节的 bug）
+			if len(extData) >= 3 {
+				protoLen := int(extData[2]) // 1 字节
+				if 3+protoLen <= len(extData) {
+					h.alpn = string(extData[3 : 3+protoLen])
 				}
 			}
 		case 0x002b: // supported_versions
@@ -228,35 +228,30 @@ func parseClientHelloJA3(hello []byte) (string, error) {
 }
 
 func buildJA3(h *tlsHello) string {
-	// 使用 strings.Builder 避免 O(n²) 字符串拼接
-	join16 := func(b *strings.Builder, vals []uint16) {
-		for i, v := range vals {
-			if i > 0 {
-				b.WriteByte('-')
-			}
-			fmt.Fprintf(b, "%d", v)
+	join16 := func(vals []uint16) string {
+		if len(vals) == 0 {
+			return ""
 		}
-	}
-	joinB := func(b *strings.Builder, vals []byte) {
-		for i, v := range vals {
-			if i > 0 {
-				b.WriteByte('-')
-			}
-			fmt.Fprintf(b, "%d", v)
+		s := fmt.Sprintf("%d", vals[0])
+		for _, v := range vals[1:] {
+			s += fmt.Sprintf("-%d", v)
 		}
+		return s
 	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d,", h.legacyVer)
-	join16(&b, h.ciphers)
-	b.WriteByte(',')
-	join16(&b, h.extTypes)
-	b.WriteByte(',')
-	join16(&b, h.curves)
-	b.WriteByte(',')
-	joinB(&b, h.pointFmts)
-
-	sum := sha256.Sum256([]byte(b.String()))
+	joinB := func(vals []byte) string {
+		if len(vals) == 0 {
+			return ""
+		}
+		s := fmt.Sprintf("%d", vals[0])
+		for _, v := range vals[1:] {
+			s += fmt.Sprintf("-%d", v)
+		}
+		return s
+	}
+	raw := fmt.Sprintf("%d,%s,%s,%s,%s",
+		h.legacyVer, join16(h.ciphers), join16(h.extTypes),
+		join16(h.curves), joinB(h.pointFmts))
+	sum := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("%x", sum[:16])
 }
 
@@ -379,7 +374,7 @@ func hashList16(vals []uint16) string {
 func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 	h, err := parseClientHello(hello)
 	if err != nil {
-		Dbgf(cfg, "[TLS-FP] parse error: %v\n", err)
+		Debugf(cfg, "[TLS-FP] parse error: %v\n", err)
 		return false
 	}
 
@@ -389,24 +384,24 @@ func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 		v = h.legacyVer
 	}
 	if v != 0 && v < 0x0303 {
-		Dbgf(cfg, "[TLS-FP] rejected old TLS version: 0x%04x\n", v)
+		Debugf(cfg, "[TLS-FP] rejected old TLS version: 0x%04x\n", v)
 		return false
 	}
 
 	ja3 := buildJA3(h)
 	ja4 := buildJA4(h)
-	Dbgf(cfg, "[TLS-FP] JA3=%s JA4=%s\n", ja3, ja4)
+	Debugf(cfg, "[TLS-FP] JA3=%s JA4=%s\n", ja3, ja4)
 
 	// 检查 2：JA3 黑名单（精确匹配）
 	if blockedJA3[ja3] {
-		Dbgf(cfg, "[TLS-FP] blocked by JA3: %s\n", ja3)
+		Debugf(cfg, "[TLS-FP] blocked by JA3: %s\n", ja3)
 		return false
 	}
 
 	// 检查 3：JA4 前缀黑名单
 	for _, prefix := range blockedJA4Prefixes {
 		if len(ja4) >= len(prefix) && ja4[:len(prefix)] == prefix {
-			Dbgf(cfg, "[TLS-FP] blocked by JA4 prefix %q: %s\n", prefix, ja4)
+			Debugf(cfg, "[TLS-FP] blocked by JA4 prefix %q: %s\n", prefix, ja4)
 			return false
 		}
 	}
@@ -415,29 +410,16 @@ func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 }
 
 // ── Replay 防护 ───────────────────────────────────────────────────────────────
-//
-// replayCache 使用定长环形队列（ring buffer）跟踪最近插入的键，
-// 避免原先 order[1:] 截取导致底层数组永不释放的内存泄漏。
-// 环形队列预分配 maxLen 个槽位，写满后覆盖最旧的条目，无需任何内存重分配。
 
 type replayCache struct {
 	mu     sync.Mutex
 	cache  map[string]bool
-	ring   []string // 定长环形缓冲区，容量 = maxLen
-	head   int      // 下一个写入位置（覆盖最旧条目）
-	count  int      // 当前已存条目数
+	order  []string
 	maxLen int
 }
 
 func NewReplayCache(maxLen int) *replayCache {
-	if maxLen <= 0 {
-		maxLen = 0
-	}
-	return &replayCache{
-		cache:  make(map[string]bool, maxLen),
-		ring:   make([]string, maxLen),
-		maxLen: maxLen,
-	}
+	return &replayCache{cache: make(map[string]bool), maxLen: maxLen}
 }
 
 func (rc *replayCache) Has(key []byte) bool {
@@ -447,22 +429,16 @@ func (rc *replayCache) Has(key []byte) bool {
 }
 
 func (rc *replayCache) Add(key []byte) {
-	if rc.maxLen <= 0 {
-		return
-	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	k := string(key)
-	if rc.count == rc.maxLen {
-		// 环形队列已满，覆盖最旧条目
-		oldest := rc.ring[rc.head]
+	if rc.maxLen > 0 && len(rc.order) >= rc.maxLen {
+		oldest := rc.order[0]
+		rc.order = rc.order[1:]
 		delete(rc.cache, oldest)
-		rc.count--
 	}
-	rc.ring[rc.head] = k
-	rc.head = (rc.head + 1) % rc.maxLen
+	k := string(key)
 	rc.cache[k] = true
-	rc.count++
+	rc.order = append(rc.order, k)
 }
 
 var UsedHandshakes *replayCache
@@ -522,7 +498,7 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 	sessIDLen := int(handshake[sessionIDLenPos])
 	sessID := handshake[sessionIDPos : sessionIDPos+sessIDLen]
 
-	Dbgf(cfg, "[DEBUG] TLS handshake: handshake len=%d digestPos=%d digest=%x\n",
+	Debugf(cfg, "[DEBUG] TLS handshake: handshake len=%d digestPos=%d digest=%x\n",
 		len(handshake), digestPos, digest[:8])
 
 	for _, secret := range cfg.Secrets {
@@ -541,7 +517,7 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 			xored[i] = digest[i] ^ computedDigest[i]
 		}
 
-		Dbgf(cfg, "[DEBUG] TLS xored[:4]=%x (want 00000000)\n", xored[:4])
+		Debugf(cfg, "[DEBUG] TLS xored[:4]=%x (want 00000000)\n", xored[:4])
 
 		// 检查前 28 字节是否为 0
 		allZero := true
@@ -562,13 +538,22 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 		const timeSkewMax = 10 * 60
 		clientTimeOK := skew > timeSkewMin && skew < timeSkewMax
 		clientTimeSmall := timestamp < 60*60*24*1000
-		Dbgf(cfg, "[DEBUG] TLS timestamp=%d now=%d skew=%d ok=%v\n", timestamp, now, skew, clientTimeOK)
+		Debugf(cfg, "[DEBUG] TLS timestamp=%d now=%d skew=%d ok=%v\n", timestamp, now, skew, clientTimeOK)
 		if !clientTimeOK && !cfg.IgnoreTimeSkew && !clientTimeSmall {
 			continue
 		}
 
-		// 修复：使用 crypto.GlobalRand 替代 math/rand，保持随机源一致
-		fakeCertLen := crypto.GlobalRand.Intn(4096-1024) + 1024
+		// 使用从 MaskHost 实际获取的证书长度（由 GetMaskHostCertLen 定期更新），
+		// 使伪造的 TLS 响应体积与真实服务器一致，增强流量伪装效果。
+		// 加读锁保护并发访问，在长度基础上加 ±64 字节随机抖动避免完全固定。
+		FakeCertMu.RLock()
+		baseLen := FakeCertLen
+		FakeCertMu.RUnlock()
+		jitter := crypto.GlobalRand.Intn(129) - 64 // [-64, +64]
+		fakeCertLen := baseLen + jitter
+		if fakeCertLen < MinCertLen {
+			fakeCertLen = MinCertLen
+		}
 		httpData := crypto.GlobalRand.Bytes(fakeCertLen)
 
 		// 预计算 srvHello 总长度，一次性分配，避免多次 append 导致的重复内存拷贝
