@@ -42,29 +42,31 @@ func logf(format string, args ...interface{}) {
 	fmt.Fprintf(logWriter, format, args...)
 }
 
-// main 包专用的分级日志辅助，直接写入 logWriter，与 proxy 包共享同一 writer
 func infof(format string, args ...interface{})  { fmt.Fprintf(logWriter, "[INFO]  "+format, args...) }
 func warnf(format string, args ...interface{})  { fmt.Fprintf(logWriter, "[WARN]  "+format, args...) }
 func errorf(format string, args ...interface{}) { fmt.Fprintf(logWriter, "[ERROR] "+format, args...) }
 
-// ── 获取公网 IP ───────────────────────────────────────────────────────────────
+// ── 获取公网 IP（遍历所有网口）─────────────────────────────────────────────────
 
-func getNetIface() string {
+// getNetIfaces 返回所有物理网卡名（eth/ens/enp 开头）
+func getNetIfaces() []string {
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
-		return ""
+		return nil
 	}
+	var ifaces []string
 	for _, e := range entries {
 		name := e.Name()
 		if strings.HasPrefix(name, "eth") ||
 			strings.HasPrefix(name, "ens") ||
 			strings.HasPrefix(name, "enp") {
-			return name
+			ifaces = append(ifaces, name)
 		}
 	}
-	return ""
+	return ifaces
 }
 
+// newHTTPClient 创建绑定指定网卡的 HTTP 客户端
 func newHTTPClient(network, iface string) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	if iface != "" {
@@ -85,31 +87,10 @@ func newHTTPClient(network, iface string) *http.Client {
 	}
 }
 
-func getIPFromURL(client *http.Client, url string) string {
-	resp, err := client.Get(url)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return ""
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	result := strings.TrimSpace(string(body))
-	if net.ParseIP(result) == nil {
-		return ""
-	}
-	return result
-}
-
-// getFirstIPConcurrent 并发请求所有 URL，返回最快成功的结果。
-// 修复：第一个结果返回后立即取消其余请求，不让输掉的 goroutine 继续等待。
+// getFirstIPConcurrent 并发请求所有 URL，返回最快成功的结果
 func getFirstIPConcurrent(client *http.Client, urls []string) string {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // 确保函数返回时所有未完成请求都被取消
+	defer cancel()
 
 	type result struct{ ip string }
 	ch := make(chan result, len(urls))
@@ -117,7 +98,6 @@ func getFirstIPConcurrent(client *http.Client, urls []string) string {
 	for _, url := range urls {
 		url := url
 		go func() {
-			// 用带 ctx 的请求，cancel() 后会立即中断
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
 				ch <- result{""}
@@ -148,16 +128,41 @@ func getFirstIPConcurrent(client *http.Client, urls []string) string {
 
 	for range urls {
 		if r := <-ch; r.ip != "" {
-			cancel() // 立即取消其余请求
+			cancel()
 			return r.ip
 		}
 	}
 	return ""
 }
 
-// initIPInfo 并发探测多个 IP 检测服务，取最快返回的结果。
+// getIPWithFallback 遍历所有网口获取 IP
+func getIPWithFallback(urls []string, ifaces []string, isIPv6 bool) string {
+	for _, iface := range ifaces {
+		network := "tcp4"
+		if isIPv6 {
+			network = "tcp6"
+		}
+		client := newHTTPClient(network, iface)
+		if ip := getFirstIPConcurrent(client, urls); ip != "" {
+			return ip
+		}
+	}
+	// 最后尝试不绑定网卡
+	network := "tcp4"
+	if isIPv6 {
+		network = "tcp6"
+	}
+	client := newHTTPClient(network, "")
+	return getFirstIPConcurrent(client, urls)
+}
+
 func initIPInfo(cfg *config.Config) {
-	iface := getNetIface()
+	ifaces := getNetIfaces()
+	if len(ifaces) == 0 {
+		warnf("No network interfaces found (eth/ens/enp), trying without binding\n")
+		ifaces = []string{""}
+	}
+
 	ipURLs := []string{
 		"http://ip.gs",
 		"http://ip.sb",
@@ -167,11 +172,11 @@ func initIPInfo(cfg *config.Config) {
 		"http://icanhazip.com",
 	}
 
-	clientV4 := newHTTPClient("tcp4", iface)
-	clientV6 := newHTTPClient("tcp6", iface)
+	// 获取 IPv4：遍历所有网口
+	ipv4 := getIPWithFallback(ipURLs, ifaces, false)
 
-	ipv4 := getFirstIPConcurrent(clientV4, ipURLs)
-	ipv6 := getFirstIPConcurrent(clientV6, ipURLs)
+	// 获取 IPv6：遍历所有网口
+	ipv6 := getIPWithFallback(ipURLs, ifaces, true)
 
 	if ipv6 != "" && !strings.Contains(ipv6, ":") {
 		ipv6 = ""
@@ -229,14 +234,14 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=dd%s",
 					ip, cfg.Port, secretHex)
 				links = append(links, map[string]string{"secret": secretHex, "link": link})
-				logf("\033[31mMtproxyurl: %s\033[0m\n", link)
+				infof("\033[31mMtproxyurl: %s\033[0m\n", link)
 			}
 			if cfg.Modes.TLS {
 				tlsSecret := "ee" + secretHex + hex.EncodeToString([]byte(cfg.TLSDomain))
 				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=%s",
 					ip, cfg.Port, tlsSecret)
 				links = append(links, map[string]string{"secret": secretHex, "link": link})
-				logf("\033[31mMtproxyurl: %s\033[0m\n", link)
+				infof("\033[31mMtproxyurl: %s\033[0m\n", link)
 			}
 		}
 		if defaultSecrets[secretHex] {
@@ -259,8 +264,6 @@ func printTGInfo(cfg *config.Config) []map[string]string {
 
 // ── 服务器启动 ────────────────────────────────────────────────────────────────
 
-// shutdownTimeout 是优雅关闭的最长等待时间。
-// 超过此时间后，仍有活跃连接也强制退出，避免因长连接导致进程无法停止。
 const shutdownTimeout = 5 * time.Second
 
 func acceptLoop(ln net.Listener, acfg *config.AtomicConfig, wg *sync.WaitGroup) {
@@ -287,7 +290,6 @@ func startServers(acfg *config.AtomicConfig, wg *sync.WaitGroup) []io.Closer {
 		if err != nil {
 			errorf("Failed to listen on %s: %v\n", addr, err)
 		} else {
-			infof("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
 			go acceptLoop(ln, acfg, wg)
 		}
@@ -299,7 +301,6 @@ func startServers(acfg *config.AtomicConfig, wg *sync.WaitGroup) []io.Closer {
 		if err != nil {
 			errorf("Failed to listen on %s: %v\n", addr, err)
 		} else {
-			infof("Listening on %s\n", addr)
 			listeners = append(listeners, ln)
 			go acceptLoop(ln, acfg, wg)
 		}
@@ -350,8 +351,6 @@ func main() {
 	if cfg.UseMiddleProxy {
 		go proxy.UpdateMiddleProxyInfo(cfg)
 	}
-	// 直连模式使用硬编码的 DC 地址列表（TGDatacentersV4/V6），
-	// Telegram 官方未提供专门的直连 DC 地址更新接口，无需定期刷新。
 
 	stats.StartMetricsServer(cfg, currentProxyLinks)
 
@@ -381,20 +380,16 @@ func main() {
 		}
 	}()
 
-	// 等待退出信号
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	infof("Shutting down...\n")
 
-	// 停止接受新连接
 	for _, ln := range listeners {
 		ln.Close()
 	}
 
-	// 等待活跃连接结束，但最多等待 shutdownTimeout。
-	// 超时后强制退出，避免长连接导致进程无法停止。
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
