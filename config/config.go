@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"mtproxy/version"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -283,6 +284,7 @@ func ParseArgs() (configPath string) {
 	var cfgPath string
 	var genSecret bool
 	var showHelp bool
+	var showVersion bool
 
 	flag.StringVar(&cfgPath, "c", defaultConfig, "")
 	flag.StringVar(&cfgPath, "config", defaultConfig, "")
@@ -290,6 +292,8 @@ func ParseArgs() (configPath string) {
 	flag.BoolVar(&genSecret, "secret", false, "")
 	flag.BoolVar(&showHelp, "h", false, "")
 	flag.BoolVar(&showHelp, "help", false, "")
+	flag.BoolVar(&showVersion, "v", false, "")
+	flag.BoolVar(&showVersion, "version", false, "")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", filepath.Base(os.Args[0]))
@@ -304,6 +308,11 @@ func ParseArgs() (configPath string) {
 
 	if showHelp {
 		flag.Usage()
+		os.Exit(0)
+	}
+
+	if showVersion {
+		fmt.Println(version.String())
 		os.Exit(0)
 	}
 
