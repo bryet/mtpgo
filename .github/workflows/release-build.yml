@@ -1,6 +1,9 @@
 name: Build and Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -40,7 +43,7 @@ jobs:
       - name: Set version
         id: set_version
         run: |
-          VERSION="${{ github.event.inputs.version }}"
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Build
