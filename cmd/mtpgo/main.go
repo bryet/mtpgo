@@ -14,7 +14,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
 	"mtproxy/config"
 	"mtproxy/crypto"
 	"mtproxy/proxy"
