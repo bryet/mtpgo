@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-
 	"gopkg.in/ini.v1"
 )
 
