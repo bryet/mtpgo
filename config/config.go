@@ -297,6 +297,7 @@ func ParseArgs() (configPath string) {
 		fmt.Fprintf(os.Stderr, "  -h, --help          显示帮助信息\n")
 		fmt.Fprintf(os.Stderr, "  -s, --secret        生成随机 32 位 hex 密钥\n")
 		fmt.Fprintf(os.Stderr, "  -c, --config        指定配置文件路径 (默认: <程序目录>/config.ini)\n")
+		fmt.Fprintf(os.Stderr, "  -v, --version       查看版本号\n")
 	}
 
 	flag.Parse()
