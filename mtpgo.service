@@ -5,8 +5,8 @@ After=network.target
 [Service]
 User=root
 Group=root
-WorkingDirectory=/var/mtproxy
-ExecStart=/var/mtproxy/mtpgo -c /var/mtproxy/config.ini
+WorkingDirectory=/var/mtpgo
+ExecStart=/var/mtpgo/mtpgo -c /var/mtpgo/config.ini
 Restart=on-failure
 RestartSec=5s
 
