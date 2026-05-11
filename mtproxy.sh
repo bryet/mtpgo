@@ -406,7 +406,7 @@ ${Green} 2.${Nc}  修改 密匙配置
 ${Green} 3.${Nc}  修改 TAG 配置
 ${Green} 4.${Nc}  修改 全部配置" && echo
     read -e -p "(默认: 取消):" mtp_modify
-    [[ -z "${mtp_modify}" ]] && echo -e "${Info} 已取消..." && return 0
+    [[ -z "${mtp_modify}" ]] && echo -e "${Error} 已取消..." && return 0
     case "${mtp_modify}" in
         1) Set_port;   Restart ;;
         2) Set_passwd; Restart ;;
