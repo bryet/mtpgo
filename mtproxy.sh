@@ -28,27 +28,35 @@ check_root(){
     fi
 }
 
-check_arch(){
-    arch=$(arch)
-    if [[ $arch == "x86_64" || $arch == "x64" || $arch == "amd64" ]]; then
-        arch="amd64"
-    elif [[ $arch == i*86 || $arch == "x86" ]]; then
-        arch="386"
-    elif [[ $arch == "aarch64" || $arch == "arm64" || $arch == armv8* ]]; then
-        arch="arm64"
-    elif [[ $arch == "armv7l" || $arch == "armv7" || $arch == arm* ]]; then
-        arch="armv7"
-    elif [[ $arch == "armv6l" || $arch == "armv6" ]]; then
-        arch="armv6"
-    elif [[ $arch == "armv5l" || $arch == "armv5" ]]; then
-        arch="armv5"
-    elif [[ $arch == "s390x" ]]; then
-        arch="s390x"
-    else
-        echo -e "${Error} 检测到您的架构不支持，请联系作者！"
-        exit 1
-    fi
-
+check_arch() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|x64|amd64)
+            arch="amd64"
+            ;;
+        i*86|x86)
+            arch="386"
+            ;;
+        aarch64|arm64|armv8*)
+            arch="arm64"
+            ;;
+        armv7*|armv7*)
+            arch="armv7"
+            ;;
+        armv6*|armv6*)
+            arch="armv6"
+            ;;
+        armv5*|armv5*)
+            arch="armv5"
+            ;;
+        s390x)
+            arch="s390x"
+            ;;
+        *)
+            echo -e "${Error} 检测到您的架构不支持: $arch"
+            exit 1
+            ;;
+    esac
     echo "架构:${Info} ${arch}"
 }
 
@@ -158,7 +166,7 @@ check_service_status(){
     if [[ "$release" == "alpine" ]]; then
         rc-service mtpgo status >/dev/null 2>&1
     else
-        systemctl is-active --quiet mtpgo.service
+        systemctl status mtpgo.service >/dev/null 2>&1
     fi
 }
 
@@ -221,24 +229,32 @@ disable_mtproxy(){
 }
 
 get_public_ip(){
-    InFaces=($(ls /sys/class/net | grep -E '^(eth|ens|enp)'))
+    local ifaces=()
+    mapfile -t ifaces < <(ls /sys/class/net | grep -E '^(eth|ens|enp)')
+
+    if [[ ${#ifaces[@]} -eq 0 ]]; then
+        mapfile -t ifaces < <(ls /sys/class/net | grep -v '^lo$')
+    fi
+
     IP_API=(
-        "http://ip.gs"
-        "http://ip.sb"
-        "http://ident.me"
-        "http://ifconfig.me"
-        "http://api.ipify.org"
-        "http://icanhazip.com"
+        "ip.gs"
+        "api64.ipify.org"
+        "ip.sb"
+        "ifconfig.me"
+        "icanhazip.com"
     )
+    IPv4=""
+    IPv6=""
 
-    for iface in "${InFaces[@]}"; do
-        for ip_api in "${IP_API[@]}"; do
-            IPv4=$(curl -s4 --max-time 2 --interface "$iface" "$ip_api")
-            IPv6=$(curl -s6 --max-time 2 --interface "$iface" "$ip_api")
+    for iface in "${ifaces[@]}"; do
+        for api in "${ip_apis[@]}"; do
+            local v4
+            v4=$(curl -s4 --max-time 2 --interface "$iface" "http://$api" 2>/dev/null)
+            [[ "$v4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && IPv4="$v4" && return 0
 
-            if [[ -n "$IPv4" || -n "$IPv6" ]]; then # 检查是否获取到IP地址
-                break 2 # 获取到任一IP类型停止循环
-            fi
+            local v6
+            v6=$(curl -s6 --max-time 2 --interface "$iface" "http://$api" 2>/dev/null)
+            [[ "$v6" =~ ^([a-f0-9:]+:+)+[a-f0-9]+$ ]] && IPv6="$v6" && return 0
         done
     done
 }
@@ -432,7 +448,6 @@ Start(){
             View
         else
             echo -e "${Error} MTProxy 启动失败，请检查日志！"
-            echo -e "${Info} 使用 'journalctl -u mtpgo.service -n 50' 查看日志"
             sleep 3s
             menu
         fi
