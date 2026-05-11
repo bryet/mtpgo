@@ -222,34 +222,27 @@ disable_mtproxy(){
 
 get_public_ip(){
     local ifaces=()
-    while IFS= read -r iface; do
-        ifaces+=("$iface")
-    done < <(ls /sys/class/net 2>/dev/null | grep -E '^(eth|ens|enp)')
+    mapfile -t ifaces < <(ls /sys/class/net | grep -E '^(eth|ens|enp)')
 
-    if [ ${#ifaces[@]} -eq 0 ]; then
-        while IFS= read -r iface; do
-            [[ "$iface" != "lo" ]] && ifaces+=("$iface")
-        done < <(ls /sys/class/net 2>/dev/null)
+    if [[ ${#ifaces[@]} -eq 0 ]]; then
+        mapfile -t ifaces < <(ls /sys/class/net | grep -v '^lo$')
     fi
 
-    local ip_apis=("api64.ipify.org" "ip.sb" "ifconfig.me" "icanhazip.com")
+    local ip_apis=("ip.gs" "ip.sb" "ident.me" "ifconfig.me" "icanhazip.com" "api.ipify.org")
     IPv4=""
     IPv6=""
 
     for iface in "${ifaces[@]}"; do
         for api in "${ip_apis[@]}"; do
-            if [[ -z "$IPv4" ]]; then
-                IPv4=$(curl -s4 --max-time 2 --interface "$iface" "https://$api" 2>/dev/null || true)
-            fi
-            if [[ -z "$IPv6" ]]; then
-                IPv6=$(curl -s6 --max-time 2 --interface "$iface" "https://$api" 2>/dev/null || true)
-            fi
-            [[ -n "$IPv4" && -n "$IPv6" ]] && break 2
+            local v4
+            v4=$(curl -s4 --max-time 2 --interface "$iface" "http://$api" 2>/dev/null)
+            [[ "$v4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && IPv4="$v4" && return 0
+
+            local v6
+            v6=$(curl -s6 --max-time 2 --interface "$iface" "http://$api" 2>/dev/null)
+            [[ "$v6" =~ ^([a-f0-9:]+:+)+[a-f0-9]+$ ]] && IPv6="$v6" && return 0
         done
     done
-
-    IPv4=$(echo "$IPv4" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-    IPv6=$(echo "$IPv6" | grep -Eo '([a-f0-9:]+:+)+[a-f0-9]+' | head -1)
 }
 
 Download(){
@@ -398,9 +391,9 @@ Set_tag(){
 }
 
 Set(){
-    echo -e "${Info} 开始设置 用户配置..."
+    echo -e "${Tip} 开始设置 用户配置..."
     check_installed_status
-    echo && echo -e "你要做什么？
+    echo && echo -e "你要修改什么？
 ${Green} 1.${Nc}  修改 端口配置
 ${Green} 2.${Nc}  修改 密匙配置
 ${Green} 3.${Nc}  修改 TAG 配置
