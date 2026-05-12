@@ -28,7 +28,7 @@ check_root(){
     fi
 }
 
-check_arch() {
+check_arch(){
     arch=$(uname -m)
     case "$arch" in
         x86_64|x64|amd64)
