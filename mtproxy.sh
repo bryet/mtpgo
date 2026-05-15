@@ -320,9 +320,10 @@ Set_passwd(){
     case "${mtp_mode}" in
         1)
             # 普通模式
-            sed -i "s/^MODES_CLASSIC = .*/MODES_CLASSIC = true/" "$mtp_conf"
-            sed -i "s/^MODES_SECURE = .*/MODES_SECURE = false/" "$mtp_conf"
-            sed -i "s/^MODES_TLS = .*/MODES_TLS = false/" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_CLASSIC = .*/MODES_CLASSIC = true/g" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_SECURE = .*/MODES_SECURE = false/g" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_TLS = .*/MODES_TLS = false/g" "$mtp_conf"
+            sed -i "s/^#\?.*TLS_DOMAIN = .*/# TLS_DOMAIN = $fake_domain/g" "$mtp_conf"
             mtp_secure="$mtp_passwd"
             sed -i "s/^#\?SECURE.*/SECURE=$mtp_secure/g" "$mtp_info"
             echo && echo "========================"
@@ -332,9 +333,10 @@ Set_passwd(){
             ;;
         2)
             # 安全模式
-            sed -i "s/^MODES_CLASSIC = .*/MODES_CLASSIC = false/" "$mtp_conf"
-            sed -i "s/^MODES_SECURE = .*/MODES_SECURE = true/" "$mtp_conf"
-            sed -i "s/^MODES_TLS = .*/MODES_TLS = false/" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_CLASSIC = .*/MODES_CLASSIC = false/g" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_SECURE = .*/MODES_SECURE = true/g" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_TLS = .*/MODES_TLS = false/g" "$mtp_conf"
+            sed -i "s/^#\?.*TLS_DOMAIN = .*/# TLS_DOMAIN = $fake_domain/g" "$mtp_conf"
             mtp_secure="dd${mtp_passwd}"
             sed -i "s/^#\?SECURE.*/SECURE=$mtp_secure/g" "$mtp_info"
             echo && echo "========================"
@@ -347,10 +349,10 @@ Set_passwd(){
             echo -e "${Tip} 请输入TLS伪装域名 ${Red}(无法使用被墙的域名。)${Nc}"
             read -e -p "(默认：itunes.apple.com):" fake_domain
             [[ -z "${fake_domain}" ]] && fake_domain="itunes.apple.com"
-            sed -i "s/^MODES_CLASSIC = .*/MODES_CLASSIC = false/" "$mtp_conf"
-            sed -i "s/^MODES_SECURE = .*/MODES_SECURE = false/" "$mtp_conf"
-            sed -i "s/^MODES_TLS = .*/MODES_TLS = true/" "$mtp_conf"
-            sed -i "s/^TLS_DOMAIN = .*/TLS_DOMAIN = $fake_domain/" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_CLASSIC = .*/MODES_CLASSIC = false/g" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_SECURE = .*/MODES_SECURE = false/g" "$mtp_conf"
+            sed -i "s/^#\?.*MODES_TLS = .*/MODES_TLS = true/g" "$mtp_conf"
+            sed -i "s/^#\?.*TLS_DOMAIN = .*/TLS_DOMAIN = $fake_domain/g" "$mtp_conf"
             mtp_secure="ee${mtp_passwd}$(echo -n "$fake_domain" | xxd -ps -c 200)"
             sed -i "s/^#\?SECURE.*/SECURE=$mtp_secure/g" "$mtp_info"
             echo && echo "========================"
