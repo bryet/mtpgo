@@ -315,7 +315,7 @@ Set_passwd(){
 
     # 生成基础密钥（32位十六进制字符，即16字节）
     mtp_passwd=$(openssl rand -hex 16)
-    sed -i "s/^SECRET = .*/SECRET = $mtp_passwd/" "$mtp_conf"
+    sed -i "s/^#\?.*SECRET = .*/SECRET = $mtp_passwd/g" "$mtp_conf"
 
     case "${mtp_mode}" in
         1)
