@@ -214,32 +214,24 @@ disable_mtproxy(){
 }
 
 get_public_ip(){
-    local ifaces=()
-    mapfile -t ifaces < <(ls /sys/class/net | grep -E '^(eth|ens|enp)')
-
-    if [[ ${#ifaces[@]} -eq 0 ]]; then
-        mapfile -t ifaces < <(ls /sys/class/net | grep -v '^lo$')
-    fi
-
+    InFaces=($(ls /sys/class/net | grep -E '^(eth|ens|enp)'))
     IP_API=(
-        "ip.gs"
-        "api64.ipify.org"
-        "ip.sb"
-        "ifconfig.me"
-        "icanhazip.com"
+        "http://ip.gs"
+        "http://ip.sb"
+        "http://ident.me"
+        "http://ifconfig.me"
+        "http://api.ipify.org"
+        "http://icanhazip.com"
     )
-    IPv4=""
-    IPv6=""
 
-    for iface in "${ifaces[@]}"; do
-        for api in "${ip_apis[@]}"; do
-            local v4
-            v4=$(curl -s4 --max-time 2 --interface "$iface" "http://$api" 2>/dev/null)
-            [[ "$v4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && IPv4="$v4" && return 0
+    for iface in "${InFaces[@]}"; do
+        for ip_api in "${IP_API[@]}"; do
+            IPv4=$(curl -s4 --max-time 2 --interface "$iface" "$ip_api")
+            IPv6=$(curl -s6 --max-time 2 --interface "$iface" "$ip_api")
 
-            local v6
-            v6=$(curl -s6 --max-time 2 --interface "$iface" "http://$api" 2>/dev/null)
-            [[ "$v6" =~ ^([a-f0-9:]+:+)+[a-f0-9]+$ ]] && IPv6="$v6" && return 0
+            if [[ -n "$IPv4" || -n "$IPv6" ]]; then # 检查是否获取到IP地址
+                break 2 # 获取到任一IP类型停止循环
+            fi
         done
     done
 }
