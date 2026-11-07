@@ -12,7 +12,7 @@ secret=$("$work/mtpgo" -s)
 "$work/mtpgo" -h >/dev/null 2>&1
 # shellcheck source=mtproxy.sh
 source "$root/mtproxy.sh"
-cp "$root/config.ini" "$work/config.ini"
+cp "$root/config.example.ini" "$work/config.ini"
 ini_set "$work/config.ini" SECRET "$secret"
 "$work/mtpgo" -check -c "$work/config.ini"
 [[ ! -f "$work/log_mtpgo" ]]

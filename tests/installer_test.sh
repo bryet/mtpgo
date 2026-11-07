@@ -28,12 +28,12 @@ assert_equal "$(ini_get "$work/edit.ini" MASK)" false
 # Build a fixture archive, then serve it through a curl stub without network.
 mkdir "$work/fixture"
 printf binary > "$work/fixture/mtpgo"
-printf config > "$work/fixture/config.ini"
+printf config > "$work/fixture/config.example.ini"
 printf service > "$work/fixture/mtpgo.service"
 printf openrc > "$work/fixture/mtpgo_openrc"
 archive=mtpgo-linux-arm64.tar.gz
 arch=arm64
-tar -czf "$work/$archive" -C "$work/fixture" mtpgo config.ini mtpgo.service mtpgo_openrc
+tar -czf "$work/$archive" -C "$work/fixture" mtpgo config.example.ini mtpgo.service mtpgo_openrc
 sum=$(sha256sum "$work/$archive"); sum=${sum%% *}
 printf '%s  %s\n' "$sum" "$archive" > "$work/manifest"
 curl() {
@@ -55,7 +55,7 @@ if fetch_release v1 "$work/download-bad"; then printf '%s\n' 'accepted bad check
 # A checksum-valid archive with a symlink must still be rejected.
 rm "$work/fixture/mtpgo"
 ln -s /etc/passwd "$work/fixture/mtpgo"
-tar -czf "$work/$archive" -C "$work/fixture" mtpgo config.ini mtpgo.service mtpgo_openrc
+tar -czf "$work/$archive" -C "$work/fixture" mtpgo config.example.ini mtpgo.service mtpgo_openrc
 sum=$(sha256sum "$work/$archive"); sum=${sum%% *}
 printf '%s  %s\n' "$sum" "$archive" > "$work/manifest"
 mkdir "$work/download-link"
@@ -82,7 +82,7 @@ fetch_release() {
     [[ "$scenario" != download-failure ]] || return 1
     mkdir "$dest/unpacked"
     cp "$work/new-program" "$dest/unpacked/mtpgo"
-    printf 'SECRET = packaged-default\nPORT = 8443\n' > "$dest/unpacked/config.ini"
+    printf 'SECRET = packaged-default\nPORT = 8443\n' > "$dest/unpacked/config.example.ini"
     printf new-service > "$dest/unpacked/mtpgo.service"
 }
 install_service_files() {

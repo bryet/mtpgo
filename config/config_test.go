@@ -60,11 +60,11 @@ func TestRejectInvalidConfig(t *testing.T) {
 	}
 }
 func TestTemplateRequiresSecret(t *testing.T) {
-	b, err := os.ReadFile("../config.ini")
+	b, err := os.ReadFile("../config.example.ini")
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := strings.Replace(string(b), "SECRET =\n", "SECRET = "+testSecret+"\n", 1)
+	text := strings.Replace(string(b), "SECRET = 00000000000000000000000000000000", "SECRET = "+testSecret, 1)
 	cfg, err := loadText(t, text)
 	if err != nil {
 		t.Fatal(err)

@@ -21,9 +21,10 @@ go build -trimpath -o mtpgo ./cmd/mtpgo
 ./mtpgo -s                  # 生成随机 32 位 hex 密钥
 ```
 
-将生成的密钥填入 `config.ini` 的 `SECRET`，再执行：
+先将 `config.example.ini` 复制为运行配置 `config.ini`，再将生成的密钥填入 `SECRET`：
 
 ```bash
+cp config.example.ini config.ini
 ./mtpgo -check -c config.ini # 只验证配置，不创建日志或连接网络
 ./mtpgo -c config.ini
 ./mtpgo -v
@@ -69,7 +70,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/bryet/mtpgo/main/mtproxy.sh)
 
 ## 配置与热重载
 
-`config.ini` 按 `config.example.yml` 的简洁布局，只保留日志级别、端口、密钥、模式，以及可选的 TLS 域名和 TAG。示例文件内容是 INI 格式，并非 YAML。未列出的高级参数继续使用程序默认值，需要时可自行追加；无需填写整套参数。以下时间单位均为秒：
+仓库和发布包中的模板名为 `config.example.ini`，初次安装时复制为运行配置 `config.ini`，升级不覆盖已有运行配置。模板只保留日志级别、端口、密钥、模式，以及可选的 TLS 域名和 TAG，内容为 INI 格式。未列出的高级参数继续使用程序默认值，需要时可自行追加；无需填写整套参数。以下时间单位均为秒：
 
 | 参数 | 含义 |
 |---|---|
