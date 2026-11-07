@@ -82,7 +82,7 @@ jobs:
             mtpgo \
             mtpgo.service \
             mtpgo_openrc \
-            config.ini
+            config.example.ini
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
