@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +31,26 @@ func TestBuildProxyLinks(t *testing.T) {
 		if err != nil || u.Query().Get("server") != c.MyDomain || u.Query().Get("port") != "3256" {
 			t.Fatal(l, err)
 		}
+		if !strings.HasPrefix(u.RawQuery, "server=2001%3Adb8%3A%3A1&port=3256&secret=") {
+			t.Fatalf("unexpected query order or encoding: %s", u.RawQuery)
+		}
+	}
+}
+func TestBuildProxyLinksTLSExample(t *testing.T) {
+	secret, err := hex.DecodeString("a059801be0015893a27af64a7106761c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.MyDomain = "192.168.2.1"
+	cfg.Port = 54164
+	cfg.Secrets = [][]byte{secret}
+	cfg.Modes = config.Modes{TLS: true}
+	cfg.TLSDomain = "itunes.apple.com"
+	links := buildProxyLinks(cfg)
+	want := "https://t.me/proxy?server=192.168.2.1&port=54164&secret=eea059801be0015893a27af64a7106761c6974756e65732e6170706c652e636f6d"
+	if len(links) != 1 || links[0]["link"] != want {
+		t.Fatalf("unexpected TLS link: %v", links)
 	}
 }
 func TestPublicIPResponses(t *testing.T) {

@@ -231,8 +231,11 @@ func buildProxyLinks(cfg *config.Config) []map[string]string {
 		}
 		for _, host := range hosts {
 			for _, sec := range secrets {
-				values := url.Values{"server": {host}, "port": {fmt.Sprint(cfg.Port)}, "secret": {sec}}
-				links = append(links, map[string]string{"secret": base, "link": "https://t.me/proxy?" + values.Encode()})
+				// Keep the displayed query order consistent with Telegram links
+				// and the installation script; Values.Encode sorts keys instead.
+				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=%s",
+					url.QueryEscape(host), cfg.Port, url.QueryEscape(sec))
+				links = append(links, map[string]string{"secret": base, "link": link})
 			}
 		}
 	}

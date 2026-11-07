@@ -391,12 +391,48 @@ func TestProxyListValidation(t *testing.T) {
 	if err != nil || len(p) != 2 {
 		t.Fatal(p, err)
 	}
-	for _, s := range []string{"", "proxy_for 0 192.0.2.1:80;", "proxy_for 1 bad:80;", "proxy_for 1 192.0.2.1:65536;"} {
+	for _, s := range []string{
+		"", "proxy_for 0 192.0.2.1:80;", "proxy_for 1 bad:80;", "proxy_for 1 192.0.2.1:65536;",
+		"proxy_for 999999999999999999999999 192.0.2.1:80;",
+		"proxy_for 203 192.0.2.203:8888;\nproxy_for 1 bad:80;",
+		"proxy_for -203 [2001:db8::203]:80;\nproxy_for 1 192.0.2.1:65536;",
+	} {
 		if _, err := parseProxyList([]byte(s)); err == nil {
 			t.Fatal(s)
 		}
 	}
 }
+func TestProxyListSkipsUnsupportedDCs(t *testing.T) {
+	body := []byte("proxy_for 203 192.0.2.203:8888;\n" +
+		"proxy_for 1 192.0.2.1:8888;\n" +
+		"proxy_for -203 [2001:db8::203]:80;\n" +
+		"proxy_for -2 [2001:db8::2]:80;\n" +
+		"proxy_for 1 192.0.2.11:8888;\n" +
+		"proxy_for 6 192.0.2.6:8888;")
+	proxies, err := parseProxyList(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proxies) != 2 || len(proxies[1]) != 2 || len(proxies[-2]) != 1 {
+		t.Fatalf("supported proxies were lost: %v", proxies)
+	}
+	if proxies[1][0] != [2]interface{}{"192.0.2.1", 8888} || proxies[-2][0] != [2]interface{}{"2001:db8::2", 80} {
+		t.Fatalf("unexpected proxy addresses: %v", proxies)
+	}
+	for _, dc := range []int{203, -203, 6} {
+		if _, ok := proxies[dc]; ok {
+			t.Fatalf("unsupported DC %d retained", dc)
+		}
+	}
+}
+
+func TestProxyListRequiresSupportedDC(t *testing.T) {
+	_, err := parseProxyList([]byte("proxy_for 203 192.0.2.203:8888;\nproxy_for -203 [2001:db8::203]:80;"))
+	if err == nil || err.Error() != "no supported DCs in proxy list" {
+		t.Fatalf("expected no-supported-DC error, got %v", err)
+	}
+}
+
 func TestFetchBodyRejectsStatusAndSize(t *testing.T) {
 	for _, tc := range []struct {
 		status int

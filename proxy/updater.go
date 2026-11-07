@@ -121,8 +121,14 @@ func parseProxyList(body []byte) (map[int][][2]interface{}, error) {
 	ans := make(map[int][][2]interface{})
 	for _, m := range proxyLineRe.FindAllStringSubmatch(string(body), -1) {
 		dc, err := strconv.Atoi(m[1])
-		if err != nil || dc == 0 || dc < -5 || dc > 5 {
-			return nil, fmt.Errorf("invalid DC index")
+		if err != nil || dc == 0 {
+			return nil, fmt.Errorf("invalid DC index: %q", m[1])
+		}
+		// Telegram also publishes special DCs (for example ±203). This
+		// proxy handles only ±1–±5; skip other DCs rather than rejecting
+		// the entire official list and retaining stale fallback nodes.
+		if dc < -5 || dc > 5 {
+			continue
 		}
 		host := strings.Trim(m[2], "[]")
 		if net.ParseIP(host) == nil {
@@ -135,7 +141,7 @@ func parseProxyList(body []byte) (map[int][][2]interface{}, error) {
 		ans[dc] = append(ans[dc], [2]interface{}{host, port})
 	}
 	if len(ans) == 0 {
-		return nil, fmt.Errorf("empty proxy list")
+		return nil, fmt.Errorf("no supported DCs in proxy list")
 	}
 	return ans, nil
 }
