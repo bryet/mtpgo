@@ -257,7 +257,6 @@ Download(){
     fi
     tar xzf "mtpgo-linux-${arch}.tar.gz"
     rm -f "mtpgo-linux-${arch}.tar.gz"
-    mv config.example.ini config.ini
 
     # 保存版本信息
     echo "$last_version" > "${mtp_dir}/version"
