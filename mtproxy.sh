@@ -500,8 +500,6 @@ Update(){
         sleep 2
     fi
 
-    [[ -f "$mtp_conf" ]] && cp "$mtp_conf" "${mtp_conf}.bak" && echo -e "${Info} 已备份配置文件"
-
     cd "${mtp_dir}" || exit 1
     check_arch
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_version}/mtpgo-linux-${arch}.tar.gz"
@@ -510,16 +508,11 @@ Update(){
     wget -q --show-progress -O "mtpgo-linux-${arch}.tar.gz" "$download_url"
     if [[ $? -ne 0 ]]; then
         echo -e "${Error} 下载失败，请检查网络连接"
-        [[ -f "${mtp_conf}.bak" ]] && mv "${mtp_conf}.bak" "$mtp_conf"
         return 1
     fi
 
     tar xzf "mtpgo-linux-${arch}.tar.gz"
     rm -f "mtpgo-linux-${arch}.tar.gz"
-
-    if [[ -f "${mtp_conf}.bak" ]] && [[ ! -f "$mtp_conf" ]]; then
-        mv "${mtp_conf}.bak" "$mtp_conf"
-    fi
 
     echo "$latest_version" > "${mtp_dir}/version"
 

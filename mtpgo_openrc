@@ -1,27 +1,9 @@
 #!/sbin/openrc-run
-# shellcheck shell=sh
-# These variables are consumed by openrc-run, not by this file directly.
-# shellcheck disable=SC2034
 
 name="mtpgo"
-description="MTProto proxy service"
-command="/var/mtpgo/mtpgo"
-command_args="-c /var/mtpgo/config.ini"
-command_user="mtpgo:mtpgo"
+description="Mtproxygo Service"
+command="/bin/sh"
+command_args="-c '/var/mtpgo/mtpgo -c /var/mtpgo/config.ini'"
 command_background="yes"
-pidfile="/run/mtpgo/mtpgo.pid"
-export MTPGO_LOG_DIR="/var/log/mtpgo"
-
-depend() {
-    need net
-}
-
-start_pre() {
-    checkpath -d -m 0700 -o mtpgo:mtpgo /run/mtpgo /var/log/mtpgo
-    "${command}" -check -c /var/mtpgo/config.ini || return 1
-}
-
-reload() {
-    "${command}" -check -c /var/mtpgo/config.ini || return 1
-    start-stop-daemon --signal USR2 --pidfile "${pidfile}"
-}
+pidfile="/var/run/${RC_SVCNAME}.pid"
+start_stop_daemon_args="--user root:root"
