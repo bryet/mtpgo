@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"mtproxy/crypto"
 )
@@ -32,15 +33,18 @@ type TCPReader struct {
 }
 
 func (r *TCPReader) Read(n int) ([]byte, map[string]bool, error) {
+	if n < 0 || n > MaxMsgLen+16 {
+		return nil, nil, fmt.Errorf("invalid read size: %d", n)
+	}
 	buf := make([]byte, n)
 	got, err := r.Conn.Read(buf)
-	if err != nil {
-		return nil, nil, err
-	}
-	return buf[:got], nil, nil
+	return buf[:got], nil, err
 }
 
 func (r *TCPReader) ReadExactly(n int) ([]byte, error) {
+	if n < 0 || n > MaxMsgLen+16 {
+		return nil, fmt.Errorf("invalid read size: %d", n)
+	}
 	buf := make([]byte, n)
 	_, err := io.ReadFull(r.Conn, buf)
 	return buf, err
@@ -51,12 +55,15 @@ type TCPWriter struct {
 }
 
 func (w *TCPWriter) Write(data []byte, extra map[string]bool) error {
-	_, err := w.Conn.Write(data)
+	n, err := w.Conn.Write(data)
+	if err == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
 func (w *TCPWriter) WriteEOF() error {
-	if tc, ok := w.Conn.(*net.TCPConn); ok {
+	if tc, ok := w.Conn.(interface{ CloseWrite() error }); ok {
 		return tc.CloseWrite()
 	}
 	return nil
@@ -75,6 +82,9 @@ type FakeTLSReader struct {
 }
 
 func (r *FakeTLSReader) ReadExactly(n int) ([]byte, error) {
+	if n < 0 || n > MaxMsgLen+16 {
+		return nil, fmt.Errorf("invalid read size: %d", n)
+	}
 	for len(r.Buf) < n {
 		data, _, err := r.readRecord()
 		if err != nil {
@@ -108,7 +118,7 @@ func (r *FakeTLSReader) readRecord() ([]byte, byte, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		if version[0] != 0x03 {
+		if version[0] != 0x03 || version[1] != 0x03 {
 			return nil, 0, fmt.Errorf("unknown TLS version: %x", version)
 		}
 		lenBytes, err := r.Upstream.ReadExactly(2)
@@ -116,11 +126,17 @@ func (r *FakeTLSReader) readRecord() ([]byte, byte, error) {
 			return nil, 0, err
 		}
 		dataLen := int(binary.BigEndian.Uint16(lenBytes))
+		if dataLen == 0 || dataLen > 16384+256 || (recType[0] != 0x14 && recType[0] != 0x17) {
+			return nil, 0, fmt.Errorf("invalid fake TLS record")
+		}
 		data, err := r.Upstream.ReadExactly(dataLen)
 		if err != nil {
 			return nil, 0, err
 		}
 		if recType[0] == 0x14 { // change cipher spec, skip
+			if len(data) != 1 || data[0] != 1 {
+				return nil, 0, fmt.Errorf("invalid change cipher spec")
+			}
 			continue
 		}
 		return data, recType[0], nil
@@ -222,6 +238,9 @@ type CryptoReader struct {
 }
 
 func (r *CryptoReader) ReadExactly(n int) ([]byte, error) {
+	if n < 0 || n > MaxMsgLen+16 {
+		return nil, fmt.Errorf("invalid read size: %d", n)
+	}
 	for len(r.Buf) < n {
 		toRead := n - len(r.Buf)
 		aligned := toRead
@@ -250,10 +269,10 @@ func (r *CryptoReader) Read(n int) ([]byte, map[string]bool, error) {
 		return out, nil, nil
 	}
 	raw, extra, err := r.Upstream.Read(n)
-	if err != nil || len(raw) == 0 {
+	if len(raw) == 0 {
 		return raw, extra, err
 	}
-	return r.Decryptor.Decrypt(raw), extra, nil
+	return r.Decryptor.Decrypt(raw), extra, err
 }
 
 type CryptoWriter struct {
@@ -274,3 +293,34 @@ func (w *CryptoWriter) Drain() error      { return w.Upstream.Drain() }
 func (w *CryptoWriter) Close()            { w.Upstream.Close() }
 func (w *CryptoWriter) Abort()            { w.Upstream.Abort() }
 func (w *CryptoWriter) GetConn() net.Conn { return w.Upstream.GetConn() }
+
+// IdleConn refreshes separate read/write deadlines per I/O operation. Long-lived
+// active streams are not cut off at an absolute timestamp. Close cancellation
+// remains authoritative because it cannot be undone by a later deadline refresh.
+type IdleConn struct {
+	net.Conn
+	ReadTimeout, WriteTimeout time.Duration
+}
+
+func (c *IdleConn) Read(p []byte) (int, error) {
+	if c.ReadTimeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.ReadTimeout)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Read(p)
+}
+func (c *IdleConn) Write(p []byte) (int, error) {
+	if c.WriteTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Write(p)
+}
+func (c *IdleConn) CloseWrite() error {
+	if c, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return c.CloseWrite()
+	}
+	return nil
+}

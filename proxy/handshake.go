@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,8 +90,8 @@ var blockedJA4Prefixes = []string{
 
 // ── 解析结构 ──────────────────────────────────────────────────────────────────
 
-// tlsHello 是解析 ClientHello 后的中间结构，供 JA3/JA4 共用，避免重复遍历。
-type tlsHello struct {
+// legacyTLSHello 是解析 ClientHello 后的中间结构，供 JA3/JA4 共用，避免重复遍历。
+type legacyTLSHello struct {
 	legacyVer   uint16
 	ciphers     []uint16 // 已过滤 GREASE，保留原始顺序（JA3 用）
 	extTypes    []uint16 // 已过滤 GREASE，保留原始顺序（JA3 用）
@@ -102,151 +104,55 @@ type tlsHello struct {
 	cipherCount int
 }
 
-// parseClientHello 解析 TLS ClientHello（不含 5 字节记录层头），
+// parseLegacyClientHello 解析 TLS ClientHello（不含 5 字节记录层头），
 // 返回供 JA3/JA4 使用的中间结构。
-func parseClientHello(hello []byte) (*tlsHello, error) {
-	if len(hello) < 38 {
-		return nil, fmt.Errorf("ClientHello too short")
+func parseLegacyClientHello(hello []byte) (*legacyTLSHello, error) {
+	parsed, err := parseClientHello(hello)
+	if err != nil {
+		return nil, err
 	}
-	if hello[0] != 0x01 {
-		return nil, fmt.Errorf("not a ClientHello")
-	}
-	pos := 4 // type(1) + length(3)
-	if pos+2 > len(hello) {
-		return nil, fmt.Errorf("truncated at version")
-	}
-	h := &tlsHello{}
-	h.legacyVer = binary.BigEndian.Uint16(hello[pos:])
-	pos += 2
-	pos += 32 // random
-	if pos >= len(hello) {
-		return nil, fmt.Errorf("truncated at session id")
-	}
-	pos += 1 + int(hello[pos]) // session id
-	if pos+2 > len(hello) {
-		return nil, fmt.Errorf("truncated at cipher suites")
-	}
-	csLen := int(binary.BigEndian.Uint16(hello[pos:]))
-	pos += 2
-	if pos+csLen > len(hello) {
-		return nil, fmt.Errorf("truncated cipher suite list")
-	}
-	for i := 0; i < csLen; i += 2 {
-		cs := binary.BigEndian.Uint16(hello[pos+i:])
-		if isGREASE(cs) || cs == 0x0000 {
-			continue
+	// Preserve historical blacklist hash inputs, including its exclusion of
+	// cipher 0. Parsing and bounds checking are shared with standard diagnostics.
+	h := &legacyTLSHello{legacyVer: parsed.legacyVer, extTypes: parsed.extTypes, curves: parsed.curves, pointFmts: parsed.pointFmts, sniPresent: parsed.sniPresent, alpn: parsed.alpn, maxTLSVer: parsed.maxTLSVer, extCount: parsed.extCount}
+	for _, cipher := range parsed.ciphers {
+		if cipher != 0 {
+			h.ciphers = append(h.ciphers, cipher)
 		}
-		h.ciphers = append(h.ciphers, cs)
 	}
 	h.cipherCount = len(h.ciphers)
-	pos += csLen
-	if pos >= len(hello) {
-		return nil, fmt.Errorf("truncated at compression")
-	}
-	pos += 1 + int(hello[pos]) // compression methods
-	if pos+2 > len(hello) {
-		return h, nil // no extensions — 合法但罕见
-	}
-	extTotalLen := int(binary.BigEndian.Uint16(hello[pos:]))
-	pos += 2
-	extEnd := pos + extTotalLen
-	if extEnd > len(hello) {
-		extEnd = len(hello)
-	}
-	for pos+4 <= extEnd {
-		extType := binary.BigEndian.Uint16(hello[pos:])
-		extLen := int(binary.BigEndian.Uint16(hello[pos+2:]))
-		pos += 4
-		end := pos + extLen
-		if end > extEnd {
-			end = extEnd
-		}
-		extData := hello[pos:end]
-		pos += extLen
-		if isGREASE(extType) {
-			continue
-		}
-		h.extTypes = append(h.extTypes, extType)
-		switch extType {
-		case 0x0000: // server_name
-			h.sniPresent = true
-		case 0x000a: // supported_groups
-			if len(extData) >= 2 {
-				listLen := int(binary.BigEndian.Uint16(extData))
-				for i := 2; i+1 < 2+listLen && i+1 < len(extData); i += 2 {
-					g := binary.BigEndian.Uint16(extData[i:])
-					if !isGREASE(g) {
-						h.curves = append(h.curves, g)
-					}
-				}
-			}
-		case 0x000b: // ec_point_formats
-			if len(extData) >= 1 {
-				fmtLen := int(extData[0])
-				for i := 1; i <= fmtLen && i < len(extData); i++ {
-					h.pointFmts = append(h.pointFmts, extData[i])
-				}
-			}
-		case 0x0010: // application_layer_protocol_negotiation
-			// ALPN 格式：list_len(2) + proto_len(1) + proto_bytes
-			// proto_len 是 1 字节，不是 2 字节（修复之前用 Uint16 读了 2 字节的 bug）
-			if len(extData) >= 3 {
-				protoLen := int(extData[2]) // 1 字节
-				if 3+protoLen <= len(extData) {
-					h.alpn = string(extData[3 : 3+protoLen])
-				}
-			}
-		case 0x002b: // supported_versions
-			if len(extData) >= 1 {
-				listLen := int(extData[0])
-				for i := 1; i+1 < 1+listLen && i+1 < len(extData); i += 2 {
-					v := binary.BigEndian.Uint16(extData[i:])
-					if !isGREASE(v) && v > h.maxTLSVer {
-						h.maxTLSVer = v
-					}
-				}
-			}
-		}
-	}
-	h.extCount = len(h.extTypes)
 	return h, nil
-}
-
-func isGREASE(v uint16) bool {
-	// GREASE 值形如 0x?A?A，其中 ? 为相同的半字节，参见 RFC 8701
-	return v&0x0f0f == 0x0a0a
 }
 
 // ── JA3 ───────────────────────────────────────────────────────────────────────
 
-func parseClientHelloJA3(hello []byte) (string, error) {
-	h, err := parseClientHello(hello)
+func parseLegacyClientHelloJA3(hello []byte) (string, error) {
+	h, err := parseLegacyClientHello(hello)
 	if err != nil {
 		return "", err
 	}
-	return buildJA3(h), nil
+	return buildLegacyJA3(h), nil
 }
 
-func buildJA3(h *tlsHello) string {
+func buildLegacyJA3(h *legacyTLSHello) string {
 	join16 := func(vals []uint16) string {
-		if len(vals) == 0 {
-			return ""
+		var b strings.Builder
+		for i, v := range vals {
+			if i > 0 {
+				b.WriteByte('-')
+			}
+			fmt.Fprintf(&b, "%d", v)
 		}
-		s := fmt.Sprintf("%d", vals[0])
-		for _, v := range vals[1:] {
-			s += fmt.Sprintf("-%d", v)
-		}
-		return s
+		return b.String()
 	}
 	joinB := func(vals []byte) string {
-		if len(vals) == 0 {
-			return ""
+		var b strings.Builder
+		for i, v := range vals {
+			if i > 0 {
+				b.WriteByte('-')
+			}
+			fmt.Fprintf(&b, "%d", v)
 		}
-		s := fmt.Sprintf("%d", vals[0])
-		for _, v := range vals[1:] {
-			s += fmt.Sprintf("-%d", v)
-		}
-		return s
+		return b.String()
 	}
 	raw := fmt.Sprintf("%d,%s,%s,%s,%s",
 		h.legacyVer, join16(h.ciphers), join16(h.extTypes),
@@ -257,15 +163,15 @@ func buildJA3(h *tlsHello) string {
 
 // ── JA4 ───────────────────────────────────────────────────────────────────────
 
-func parseClientHelloJA4(hello []byte) (string, error) {
-	h, err := parseClientHello(hello)
+func parseLegacyClientHelloJA4(hello []byte) (string, error) {
+	h, err := parseLegacyClientHello(hello)
 	if err != nil {
 		return "", err
 	}
-	return buildJA4(h), nil
+	return buildLegacyJA4(h), nil
 }
 
-// buildJA4 按 JA4 规范构造指纹字符串：
+// buildLegacyJA4 按 JA4 规范构造指纹字符串：
 //
 //	t<tlsVer><sni><cc><ec><alpn>_<cipherHash>_<extHash>
 //
@@ -275,7 +181,7 @@ func parseClientHelloJA4(hello []byte) (string, error) {
 //	alpn       : 首个 ALPN 协议名的首尾字符；无则 "00"
 //	cipherHash : 排序后 cipher 列表的 SHA-256[:6] hex
 //	extHash    : 排序后 extension 列表（去除SNI/ALPN）的 SHA-256[:6] hex
-func buildJA4(h *tlsHello) string {
+func buildLegacyJA4(h *legacyTLSHello) string {
 	// TLS 版本：优先使用 supported_versions extension 中的最高版本
 	v := h.maxTLSVer
 	if v == 0 {
@@ -325,7 +231,7 @@ func buildJA4(h *tlsHello) string {
 	sortedCiphers := make([]uint16, len(h.ciphers))
 	copy(sortedCiphers, h.ciphers)
 	sortUint16(sortedCiphers)
-	cipherHash := hashList16(sortedCiphers)
+	cipherHash := hashLegacyList16(sortedCiphers)
 
 	// 排序后的 extension hash（规范要求排除 SNI=0x0000 和 ALPN=0x0010）
 	var extsForHash []uint16
@@ -335,25 +241,18 @@ func buildJA4(h *tlsHello) string {
 		}
 	}
 	sortUint16(extsForHash)
-	extHash := hashList16(extsForHash)
+	extHash := hashLegacyList16(extsForHash)
 
 	prefix := fmt.Sprintf("t%s%s%02d%02d%s", tlsVerStr, sni, cc, ec, alpnTag)
 	return fmt.Sprintf("%s_%s_%s", prefix, cipherHash, extHash)
 }
 
-func sortUint16(s []uint16) {
-	// 插入排序；cipher/extension 列表通常 ≤ 20 项，插入排序足够快
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
-}
+func sortUint16(s []uint16) { sort.Slice(s, func(i, j int) bool { return s[i] < s[j] }) }
 
-// hashList16 将 uint16 切片以大端字节序拼接后取 SHA-256[:6] hex（12字符）。
+// hashLegacyList16 将 uint16 切片以大端字节序拼接后取 SHA-256[:6] hex（12字符）。
 // 空切片返回 SHA-256("") 的前 6 字节 hex = "e3b0c44298fc"，
 // 此值已加入 blockedJA4Prefixes，用于识别 cipher 列表为空的畸形探测包。
-func hashList16(vals []uint16) string {
+func hashLegacyList16(vals []uint16) string {
 	var b []byte
 	for _, v := range vals {
 		b = append(b, byte(v>>8), byte(v))
@@ -364,6 +263,9 @@ func hashList16(vals []uint16) string {
 
 // ── 统一验证入口 ──────────────────────────────────────────────────────────────
 
+// verifyTLSFingerprint retains BOTH existing legacy blacklist checks below.
+// Standard ClientHello validation and JA3/JA4 diagnostics only add checks; they
+// do not bypass or disable the historical policy.
 // verifyTLSFingerprint 对 fake-TLS 握手中的 ClientHello 进行双重指纹检查：
 //  1. JA3 黑名单（hash 精确匹配）
 //  2. JA4 前缀黑名单（前缀匹配，精确到 cipherHash 段）
@@ -372,7 +274,10 @@ func hashList16(vals []uint16) string {
 // 任一检查失败则返回 false（拒绝连接）。
 // 此函数仅在 TLS 模式下调用，Classic/Secure 模式不经过此验证。
 func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
-	h, err := parseClientHello(hello)
+	if !validTLSClientHello(hello, cfg) {
+		return false
+	}
+	h, err := parseLegacyClientHello(hello)
 	if err != nil {
 		Debugf(cfg, "[TLS-FP] parse error: %v\n", err)
 		return false
@@ -388,9 +293,9 @@ func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 		return false
 	}
 
-	ja3 := buildJA3(h)
-	ja4 := buildJA4(h)
-	Debugf(cfg, "[TLS-FP] JA3=%s JA4=%s\n", ja3, ja4)
+	ja3 := buildLegacyJA3(h)
+	ja4 := buildLegacyJA4(h)
+	Debugf(cfg, "[TLS-FP] legacy-JA3=%s legacy-JA4=%s\n", ja3, ja4)
 
 	// 检查 2：JA3 黑名单（精确匹配）
 	if blockedJA3[ja3] {
@@ -411,38 +316,60 @@ func verifyTLSFingerprint(hello []byte, cfg *config.Config) bool {
 
 // ── Replay 防护 ───────────────────────────────────────────────────────────────
 
+// A stable cache survives reloads. Authentication precedes atomic check-and-add.
 type replayCache struct {
 	mu     sync.Mutex
 	cache  map[string]bool
 	order  []string
+	next   int
 	maxLen int
 }
 
 func NewReplayCache(maxLen int) *replayCache {
 	return &replayCache{cache: make(map[string]bool), maxLen: maxLen}
 }
-
-func (rc *replayCache) Has(key []byte) bool {
+func (rc *replayCache) Resize(n int) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	return rc.cache[string(key)]
+	if n == rc.maxLen {
+		return
+	}
+	keys := append(append([]string(nil), rc.order[rc.next:]...), rc.order[:rc.next]...)
+	if n <= 0 {
+		keys = nil
+	} else if len(keys) > n {
+		keys = keys[len(keys)-n:]
+	}
+	rc.cache = make(map[string]bool, len(keys))
+	for _, k := range keys {
+		rc.cache[k] = true
+	}
+	rc.order = keys
+	rc.next = 0
+	rc.maxLen = n
 }
-
-func (rc *replayCache) Add(key []byte) {
+func (rc *replayCache) CheckAndAdd(key []byte) bool {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	if rc.maxLen > 0 && len(rc.order) >= rc.maxLen {
-		oldest := rc.order[0]
-		rc.order = rc.order[1:]
-		delete(rc.cache, oldest)
+	if rc.maxLen <= 0 {
+		return true
 	}
 	k := string(key)
+	if rc.cache[k] {
+		return false
+	}
+	if len(rc.order) < rc.maxLen {
+		rc.order = append(rc.order, k)
+	} else {
+		delete(rc.cache, rc.order[rc.next])
+		rc.order[rc.next] = k
+		rc.next = (rc.next + 1) % rc.maxLen
+	}
 	rc.cache[k] = true
-	rc.order = append(rc.order, k)
+	return true
 }
 
-var UsedHandshakes *replayCache
-var ClientIPs *replayCache
+var UsedHandshakes = NewReplayCache(65536)
 
 // ── 握手结果 ──────────────────────────────────────────────────────────────────
 
@@ -469,6 +396,14 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 
 	sessionIDLenPos := digestPos + digestLen
 	sessionIDPos := sessionIDLenPos + 1
+	if !cfg.Modes.TLS || len(handshake) < sessionIDPos || !verifyTLSFingerprint(handshake[5:], cfg) {
+		return nil, nil, fmt.Errorf("invalid or disabled TLS handshake")
+	}
+	sessIDLen := int(handshake[sessionIDLenPos])
+	if sessIDLen > 32 || sessionIDPos+sessIDLen > len(handshake) {
+		return nil, nil, fmt.Errorf("invalid session ID")
+	}
+	sessID := handshake[sessionIDPos : sessionIDPos+sessIDLen]
 
 	tlsVers := []byte{0x03, 0x03}
 	tlsCiphersuite := []byte{0x13, 0x01}
@@ -480,23 +415,6 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 	tlsExtensions = append(tlsExtensions, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04)
 
 	digest := handshake[digestPos : digestPos+digestLen]
-
-	if UsedHandshakes.Has(digest[:digestHalfLen]) {
-		return nil, nil, fmt.Errorf("duplicate handshake")
-	}
-
-	// ── TLS 指纹验证 ──────────────────────────────────────────────────────────
-	// handshake[4:] 是 ClientHello 报文体（已跳过 5 字节记录层头）。
-	// 指纹不合法时直接拒绝，不继续尝试 secret 匹配，减少信息泄露。
-	if len(handshake) < 6 {
-		return nil, nil, fmt.Errorf("handshake too short for fingerprint")
-	}
-	if !verifyTLSFingerprint(handshake[5:], cfg) {
-		return nil, nil, fmt.Errorf("TLS fingerprint rejected")
-	}
-
-	sessIDLen := int(handshake[sessionIDLenPos])
-	sessID := handshake[sessionIDPos : sessionIDPos+sessIDLen]
 
 	Debugf(cfg, "[DEBUG] TLS handshake: handshake len=%d digestPos=%d digest=%x\n",
 		len(handshake), digestPos, digest[:8])
@@ -519,15 +437,7 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 
 		Debugf(cfg, "[DEBUG] TLS xored[:4]=%x (want 00000000)\n", xored[:4])
 
-		// 检查前 28 字节是否为 0
-		allZero := true
-		for _, b := range xored[:digestLen-4] {
-			if b != 0 {
-				allZero = false
-				break
-			}
-		}
-		if !allZero {
+		if !hmac.Equal(digest[:digestLen-4], computedDigest[:digestLen-4]) {
 			continue
 		}
 
@@ -589,12 +499,11 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 		computedDigest2 := mac2.Sum(nil)
 		copy(helloPkt[digestPos:], computedDigest2)
 
+		if cfg.ReplayCheckLen > 0 && !UsedHandshakes.CheckAndAdd(digest[:digestHalfLen]) {
+			return nil, nil, fmt.Errorf("duplicate handshake")
+		}
 		if err := writer.Write(helloPkt, nil); err != nil {
 			return nil, nil, err
-		}
-
-		if cfg.ReplayCheckLen > 0 {
-			UsedHandshakes.Add(digest[:digestHalfLen])
 		}
 
 		return &proto.FakeTLSReader{Upstream: reader}, &proto.FakeTLSWriter{Upstream: writer}, nil
@@ -606,7 +515,7 @@ func handleFakeTLSHandshake(handshake []byte, reader proto.StreamReader, writer 
 // ── 主握手处理 ────────────────────────────────────────────────────────────────
 
 func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byte, error) {
-	tlsStartBytes := []byte{0x16, 0x03, 0x01}
+	tlsStartBytes := []byte{0x16, 0x03}
 
 	reader := &proto.TCPReader{Conn: conn}
 	writer := &proto.TCPWriter{Conn: conn}
@@ -637,13 +546,21 @@ func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byt
 	}
 
 	if isTLS {
+		version, err := reader.ReadExactly(1)
+		if err != nil {
+			return nil, nil, err
+		}
+		handshake = append(handshake, version...)
+		if version[0] != 1 && version[0] != 3 {
+			isTLS = false
+		}
 		lenBytes, err := reader.ReadExactly(2)
 		if err != nil {
 			return nil, nil, err
 		}
 		handshake = append(handshake, lenBytes...)
 		tlsLen := int(binary.BigEndian.Uint16(lenBytes))
-		if tlsLen < 512 {
+		if !isTLS || tlsLen < 42 || tlsLen > 16384 {
 			isTLS = false
 		} else {
 			body, err := reader.ReadExactly(tlsLen)
@@ -658,7 +575,7 @@ func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byt
 	var sw proto.StreamWriter = writer
 
 	if isTLS {
-		newReader, newWriter, err := handleFakeTLSHandshake(handshake, sr, sw, conn.RemoteAddr(), cfg)
+		newReader, newWriter, err := handleFakeTLSHandshake(handshake, sr, sw, peerAddr, cfg)
 		if err != nil {
 			return nil, handshake, fmt.Errorf("tls handshake failed: %w", err)
 		}
@@ -690,10 +607,6 @@ func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byt
 	encPrekey := encPrekeyAndIV[:config.PrekeyLen]
 	encIV := encPrekeyAndIV[config.PrekeyLen:]
 
-	if cfg.ReplayCheckLen > 0 && UsedHandshakes.Has(decPrekeyAndIV) {
-		return nil, handshake, fmt.Errorf("replay detected")
-	}
-
 	for _, secret := range cfg.Secrets {
 		decInput := make([]byte, len(decPrekey)+len(secret))
 		copy(decInput, decPrekey)
@@ -724,6 +637,9 @@ func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byt
 			continue
 		}
 
+		if isTLS && !cfg.Modes.TLS {
+			continue
+		}
 		if isSecure {
 			if isTLS && !cfg.Modes.TLS {
 				continue
@@ -738,9 +654,14 @@ func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byt
 		}
 
 		dcIdx := int(int16(binary.LittleEndian.Uint16(decrypted[config.DCIdxPos : config.DCIdxPos+2])))
+		if dcIdx == 0 || dcIdx < -5 || dcIdx > 5 {
+			return nil, handshake, fmt.Errorf("invalid DC index: %d", dcIdx)
+		}
 
 		if cfg.ReplayCheckLen > 0 {
-			UsedHandshakes.Add(decPrekeyAndIV)
+			if !UsedHandshakes.CheckAndAdd(decPrekeyAndIV) {
+				return nil, handshake, fmt.Errorf("replay detected")
+			}
 		}
 
 		encIV16b := make([]byte, 16)
@@ -756,7 +677,7 @@ func HandleHandshake(conn net.Conn, cfg *config.Config) (*HandshakeResult, []byt
 			SecretHex: fmt.Sprintf("%x", secret),
 			DcIdx:     dcIdx,
 			EncKeyIV:  append(encKey, encIV...),
-			Peer:      conn.RemoteAddr(),
+			Peer:      peerAddr,
 		}, nil, nil
 	}
 

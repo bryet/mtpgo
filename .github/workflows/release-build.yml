@@ -9,10 +9,26 @@ on:
         default: 'latest'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: bash -n mtproxy.sh && bash tests/installer_test.sh && bash tests/cli_test.sh
+      - run: shellcheck -x mtproxy.sh mtpgo_openrc tests/*.sh
+      - run: go test ./proxy -run '^$' -fuzz FuzzClientHello -fuzztime 10s
+      - run: go test ./proto -run '^$' -fuzz FuzzProxyProtocol -fuzztime 10s
+      - run: go test ./proto -run '^$' -fuzz FuzzFrameLength -fuzztime 10s
+
   build:
+    needs: test
     name: Build (${{ matrix.arch }})
     runs-on: ubuntu-latest
     outputs:
@@ -39,12 +55,15 @@ jobs:
 
       - name: Set version
         id: set_version
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          [[ "$VERSION" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]] || exit 1
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build
         env:
+          VERSION: ${{ steps.set_version.outputs.version }}
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
@@ -75,6 +94,8 @@ jobs:
   release:
     name: Create Release
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts

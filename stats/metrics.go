@@ -1,9 +1,12 @@
 package stats
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -41,9 +44,10 @@ func makeMetricsPkt(entries []metricEntry, prefix string) string {
 					valStr = v
 					continue
 				}
-				escaped := strings.ReplaceAll(v, `"`, `\"`)
+				escaped := strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`).Replace(v)
 				tags = append(tags, fmt.Sprintf(`%s="%s"`, k, escaped))
 			}
+			sort.Strings(tags)
 			fmt.Fprintf(&sb, "%s{%s} %s\n", fullName, strings.Join(tags, ","), valStr)
 		} else {
 			fmt.Fprintf(&sb, "%s %v\n", fullName, e.val)
@@ -72,7 +76,7 @@ func ipAllowed(clientIP string, whitelist []string) bool {
 			}
 		} else {
 			// 精确 IP 匹配
-			if entry == clientIP {
+			if ip := net.ParseIP(entry); ip != nil && ip.Equal(parsed) {
 				return true
 			}
 		}
@@ -98,8 +102,8 @@ func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.Han
 		var entries []metricEntry
 
 		uptime := time.Since(ProxyStartTime).Seconds()
-		entries = append(entries, metricEntry{"uptime", "counter", "proxy uptime", nil, uptime})
-		entries = append(entries, metricEntry{"connects_bad", "counter", "connects with bad secret", nil,
+		entries = append(entries, metricEntry{"uptime", "gauge", "proxy uptime", nil, uptime})
+		entries = append(entries, metricEntry{"connects_bad", "counter", "rejected incoming handshakes", nil,
 			atomic.LoadInt64(&GlobalStats.ConnectsBad)})
 		entries = append(entries, metricEntry{"connects_all", "counter", "incoming connects", nil,
 			atomic.LoadInt64(&GlobalStats.ConnectsAll)})
@@ -113,7 +117,7 @@ func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.Han
 					"link": link["link"],
 					"val":  "1",
 				}
-				entries = append(entries, metricEntry{"proxy_link_info", "counter", "the proxy link info", labels, 1})
+				entries = append(entries, metricEntry{"proxy_link_info", "gauge", "the proxy link info", labels, 1})
 			}
 		}
 
@@ -175,7 +179,7 @@ func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.Han
 					val = atomic.LoadInt64(&st.MsgsToClt)
 				}
 				labels := map[string]string{
-					"user": secretHex[:8] + "...",
+					"user": UserID(secretHex),
 					"val":  fmt.Sprintf("%d", val),
 				}
 				entries = append(entries, metricEntry{um.name, um.mtype, um.desc, labels, val})
@@ -193,88 +197,58 @@ func MetricsHandler(cfg *config.Config, proxyLinks []map[string]string) http.Han
 	}
 }
 
-// StartMetricsServer 启动 Prometheus metrics HTTP 服务器。
-// 修复：设置 ReadTimeout / WriteTimeout / IdleTimeout，防止慢速客户端
-// 长期占用连接耗尽服务器资源。
-func StartMetricsServer(cfg *config.Config, proxyLinks []map[string]string) {
-	if cfg.MetricsPort == 0 {
-		return
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", MetricsHandler(cfg, proxyLinks))
-
-	newServer := func(addr string) *http.Server {
-		return &http.Server{
-			Addr:         addr,
-			Handler:      mux,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 10 * time.Second,
-			IdleTimeout:  30 * time.Second,
+// NewMetricsHandler derives links from the same immutable snapshot as its
+// whitelist and export flag, so reloaded secrets are never paired with old links.
+func NewMetricsHandler(a *config.AtomicConfig, links func(*config.Config) []map[string]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := a.Get()
+		var current []map[string]string
+		if cfg.MetricsExportLinks {
+			current = links(cfg)
 		}
-	}
-
-	if cfg.MetricsListenAddrV4 != "" {
-		addr := fmt.Sprintf("%s:%d", cfg.MetricsListenAddrV4, cfg.MetricsPort)
-		go func() {
-			if err := newServer(addr).ListenAndServe(); err != nil {
-				fmt.Printf("Metrics server error: %v\n", err)
-			}
-		}()
-	}
-
-	if cfg.MetricsListenAddrV6 != "" {
-		addr := fmt.Sprintf("[%s]:%d", cfg.MetricsListenAddrV6, cfg.MetricsPort)
-		go func() {
-			if err := newServer(addr).ListenAndServe(); err != nil {
-				fmt.Printf("Metrics server (v6) error: %v\n", err)
-			}
-		}()
+		MetricsHandler(cfg, current)(w, r)
 	}
 }
 
-// StartMetricsServerAtomic 是 StartMetricsServer 的 AtomicConfig 版本。
-// handler 每次请求时通过 atomicCfg.Get() 取得最新配置，热重载后白名单等立即生效。
-// proxyLinks 通过闭包持有指针，热重载时由 main goroutine 更新同一变量。
-func StartMetricsServerAtomic(atomicCfg *config.AtomicConfig, proxyLinks []map[string]string) {
-	cfg := atomicCfg.Get()
+// Bind synchronously so startup errors are visible. Return servers for shutdown.
+func StartMetricsServer(a *config.AtomicConfig, links func(*config.Config) []map[string]string, logf func(string, ...interface{})) ([]*http.Server, error) {
+	cfg := a.Get()
 	if cfg.MetricsPort == 0 {
-		return
+		return nil, nil
 	}
-
-	// handler 闭包每次请求时重新 Get()，不缓存 cfg 指针
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		MetricsHandler(atomicCfg.Get(), proxyLinks)(w, r)
-	}
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handler)
-
-	newServer := func(addr string) *http.Server {
-		return &http.Server{
-			Addr:         addr,
-			Handler:      mux,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 10 * time.Second,
-			IdleTimeout:  30 * time.Second,
+	mux.HandleFunc("/", NewMetricsHandler(a, links))
+	var servers []*http.Server
+	var listeners []net.Listener
+	for _, item := range []struct{ network, host string }{{"tcp4", cfg.MetricsListenAddrV4}, {"tcp6", cfg.MetricsListenAddrV6}} {
+		if item.host == "" {
+			continue
 		}
+		addr := net.JoinHostPort(item.host, fmt.Sprint(cfg.MetricsPort))
+		ln, err := net.Listen(item.network, addr)
+		if err != nil {
+			for _, ln := range listeners {
+				ln.Close()
+			}
+			return nil, fmt.Errorf("metrics listen %s: %w", addr, err)
+		}
+		listeners = append(listeners, ln)
+		servers = append(servers, &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second})
 	}
-
-	if cfg.MetricsListenAddrV4 != "" {
-		addr := fmt.Sprintf("%s:%d", cfg.MetricsListenAddrV4, cfg.MetricsPort)
+	for i, server := range servers {
+		ln := listeners[i]
 		go func() {
-			if err := newServer(addr).ListenAndServe(); err != nil {
-				fmt.Printf("Metrics server error: %v\n", err)
+			if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logf("Metrics server error: %v\n", err)
 			}
 		}()
 	}
-
-	if cfg.MetricsListenAddrV6 != "" {
-		addr := fmt.Sprintf("[%s]:%d", cfg.MetricsListenAddrV6, cfg.MetricsPort)
-		go func() {
-			if err := newServer(addr).ListenAndServe(); err != nil {
-				fmt.Printf("Metrics server (v6) error: %v\n", err)
-			}
-		}()
+	return servers, nil
+}
+func ShutdownMetrics(ctx context.Context, servers []*http.Server) {
+	for _, s := range servers {
+		if err := s.Shutdown(ctx); err != nil {
+			s.Close()
+		}
 	}
 }

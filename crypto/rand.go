@@ -18,9 +18,13 @@ type CryptoRand struct {
 
 func NewCryptoRand() *CryptoRand {
 	key := make([]byte, 32)
-	rand.Read(key)
+	if _, err := rand.Read(key); err != nil {
+		panic(err)
+	}
 	ivBytes := make([]byte, 16)
-	rand.Read(ivBytes)
+	if _, err := rand.Read(ivBytes); err != nil {
+		panic(err)
+	}
 	iv := Uint128FromBytes(ivBytes)
 	return &CryptoRand{
 		ctr: NewAESCTR(key, iv),
@@ -47,9 +51,17 @@ func (r *CryptoRand) Bytes(n int) []byte {
 
 // Intn 返回 [0, n) 范围内的密码学安全随机整数。
 func (r *CryptoRand) Intn(n int) int {
-	b := r.Bytes(8)
-	val := binary.BigEndian.Uint64(b)
-	return int(val % uint64(n))
+	if n <= 0 {
+		panic("Intn requires a positive bound")
+	}
+	bound := uint64(n)
+	threshold := -bound % bound
+	for {
+		val := binary.BigEndian.Uint64(r.Bytes(8))
+		if val >= threshold {
+			return int(val % bound)
+		}
+	}
 }
 
 func (r *CryptoRand) Choice(s []string) string {

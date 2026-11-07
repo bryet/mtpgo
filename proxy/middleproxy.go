@@ -119,7 +119,11 @@ func getMiddleproxyAESKeyIV(nonceSrv, nonceClt, cltTS, srvIP, cltPort, purpose,
 	return key, iv[:]
 }
 
-func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter, string, int, error) {
+func middleproxyHandshake(conn net.Conn, timeout time.Duration) (proto.StreamReader, proto.StreamWriter, string, int, error) {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, "", 0, err
+	}
+	defer conn.SetDeadline(time.Time{})
 	const startSeqNo = -2
 	const nonceLen = 16
 
@@ -135,6 +139,9 @@ func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter
 
 	// 线程安全地读取 ProxySecret（写操作在 updater.go 中通过 setProxySecret 加锁）
 	proxySecret := GetProxySecret()
+	if len(proxySecret) != 128 {
+		return nil, nil, "", 0, fmt.Errorf("invalid middle proxy secret length")
+	}
 	keySelector := proxySecret[:4]
 	cryptoTS := make([]byte, 4)
 	binary.LittleEndian.PutUint32(cryptoTS, uint32(time.Now().Unix()))
@@ -148,7 +155,10 @@ func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter
 
 	frameR := &proto.MtprotoFrameReader{Upstream: r, SeqNo: startSeqNo}
 	ans, _, err := frameR.Read(1024)
-	if err != nil || len(ans) != 32 {
+	if err != nil {
+		return nil, nil, "", 0, fmt.Errorf("rpc nonce read: %w", err)
+	}
+	if len(ans) != 32 {
 		return nil, nil, "", 0, fmt.Errorf("bad rpc answer")
 	}
 
@@ -161,8 +171,14 @@ func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter
 		return nil, nil, "", 0, fmt.Errorf("bad rpc nonce answer")
 	}
 
-	localAddr := conn.LocalAddr().(*net.TCPAddr)
-	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+	localAddr, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return nil, nil, "", 0, fmt.Errorf("non-TCP local address")
+	}
+	remoteAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return nil, nil, "", 0, fmt.Errorf("non-TCP remote address")
+	}
 
 	tgIP := remoteAddr.IP
 	myIP := localAddr.IP
@@ -212,7 +228,10 @@ func middleproxyHandshake(conn net.Conn) (proto.StreamReader, proto.StreamWriter
 
 	frameR.Upstream = &proto.CryptoReader{Upstream: r, Decryptor: decryptor, BlockSize: 16}
 	hsAns, _, err := frameR.Read(1024)
-	if err != nil || len(hsAns) != 32 {
+	if err != nil {
+		return nil, nil, "", 0, fmt.Errorf("rpc handshake read: %w", err)
+	}
+	if len(hsAns) != 32 {
 		return nil, nil, "", 0, fmt.Errorf("bad rpc handshake answer")
 	}
 	hsType := hsAns[:4]
@@ -266,11 +285,12 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 	}
 
 	addr := net.JoinHostPort(dc, fmt.Sprintf("%d", TGDatacenterPort))
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	conn, err := net.DialTimeout("tcp", addr, time.Duration(cfg.TGConnectTimeout)*time.Second)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to dc %s: %w", addr, err)
 	}
 
+	conn.SetDeadline(time.Now().Add(time.Duration(cfg.TGConnectTimeout) * time.Second))
 	// 生成随机 nonce
 	var rnd []byte
 	for {
@@ -302,6 +322,10 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 	copy(rnd[config.ProtoTagPos:], protoTag)
 
 	if decKeyAndIV != nil {
+		if len(decKeyAndIV) != config.KeyLen+config.IVLen {
+			conn.Close()
+			return nil, nil, fmt.Errorf("invalid fast-mode key length")
+		}
 		reversed := make([]byte, len(decKeyAndIV))
 		copy(reversed, decKeyAndIV)
 		ReverseBytes(reversed)
@@ -331,15 +355,15 @@ func DoDirectHandshake(protoTag []byte, dcIdx int, decKeyAndIV []byte, cfg *conf
 	encryptedRnd := encryptor.Encrypt(rnd)
 	copy(rndEnc[config.ProtoTagPos:], encryptedRnd[config.ProtoTagPos:])
 
-	if _, err := conn.Write(rndEnc); err != nil {
+	if err := (&proto.TCPWriter{Conn: conn}).Write(rndEnc, nil); err != nil {
 		conn.Close()
 		return nil, nil, err
 	}
-	// DC 连接的生命周期由上层 pipeReaderToWriter 通过 ctx 取消 + SetDeadline 管理，
-	// 此处不设置 deadline，避免绝对时间点导致长连接被意外截断。
+	conn.SetDeadline(time.Time{})
+	idle := &proto.IdleConn{Conn: conn, ReadTimeout: time.Duration(cfg.TGReadTimeout) * time.Second, WriteTimeout: time.Duration(cfg.TGReadTimeout) * time.Second}
 
-	r := &proto.TCPReader{Conn: conn}
-	w := &proto.TCPWriter{Conn: conn}
+	r := &proto.TCPReader{Conn: idle}
+	w := &proto.TCPWriter{Conn: idle}
 	return &proto.CryptoReader{Upstream: r, Decryptor: decryptor, BlockSize: 1},
 		&proto.CryptoWriter{Upstream: w, Encryptor: encryptor, BlockSize: 1}, nil
 }
@@ -367,7 +391,7 @@ func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int,
 	}
 	MiddleProxyMu.RUnlock()
 
-	if !ok {
+	if !ok || len(proxies) == 0 {
 		proto := "v4"
 		if useIPv6 {
 			proto = "v6"
@@ -378,17 +402,25 @@ func DoMiddleproxyHandshake(protoTag []byte, dcIdx int, clIP string, clPort int,
 	host := chosen[0].(string)
 	port := chosen[1].(int)
 
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), 10*time.Second)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), time.Duration(cfg.TGConnectTimeout)*time.Second)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	frameR, frameW, myIP, myPort, err := middleproxyHandshake(conn)
+	frameR, frameW, myIP, myPort, err := middleproxyHandshake(conn, time.Duration(cfg.TGConnectTimeout)*time.Second)
 	if err != nil {
 		conn.Close()
 		return nil, nil, err
 	}
 
+	idle := &proto.IdleConn{Conn: conn, ReadTimeout: time.Duration(cfg.TGReadTimeout) * time.Second, WriteTimeout: time.Duration(cfg.TGReadTimeout) * time.Second}
+	// The CBC/frame adapters retain state from the handshake; replace only TCP.
+	if fr, ok := frameR.(*proto.MtprotoFrameReader); ok {
+		setClientConn(fr.Upstream, idle)
+	}
+	if fw, ok := frameW.(*proto.MtprotoFrameWriter); ok {
+		setWriterConn(fw.Upstream, idle)
+	}
 	proxyR := &proxyReqReader{upstream: frameR}
 	proxyW := newProxyReqWriter(frameW, clIP, clPort, myIP, myPort, protoTag, cfg)
 
@@ -406,17 +438,20 @@ func (r *proxyReqReader) ReadExactly(n int) ([]byte, error) {
 
 // 中间代理响应类型魔数，声明为包级变量避免每次调用重复分配
 var (
-	rpcProxyAns = [4]byte{0x0d, 0xda, 0x03, 0x44}
-	rpcCloseExt = [4]byte{0xa2, 0x34, 0xb6, 0x5e}
+	rpcProxyAns  = [4]byte{0x0d, 0xda, 0x03, 0x44}
+	rpcCloseExt  = [4]byte{0xa2, 0x34, 0xb6, 0x5e}
 	rpcSimpleAck = [4]byte{0x9b, 0x40, 0xac, 0x3b}
-	rpcUnknown  = [4]byte{0xdf, 0xa2, 0x30, 0x57}
+	rpcUnknown   = [4]byte{0xdf, 0xa2, 0x30, 0x57}
 )
 
 func (r *proxyReqReader) Read(bufSize int) ([]byte, map[string]bool, error) {
 
 	data, _, err := r.upstream.Read(bufSize)
-	if err != nil || len(data) < 4 {
+	if err != nil {
 		return nil, nil, err
+	}
+	if len(data) < 4 {
+		return nil, nil, fmt.Errorf("truncated proxy response")
 	}
 	var ansType [4]byte
 	copy(ansType[:], data[:4])
@@ -424,9 +459,15 @@ func (r *proxyReqReader) Read(bufSize int) ([]byte, map[string]bool, error) {
 		return nil, nil, fmt.Errorf("remote closed")
 	}
 	if ansType == rpcProxyAns {
+		if len(data) < 16 {
+			return nil, nil, fmt.Errorf("truncated proxy answer")
+		}
 		return data[16:], nil, nil
 	}
 	if ansType == rpcSimpleAck {
+		if len(data) != 16 {
+			return nil, nil, fmt.Errorf("invalid quick ack length")
+		}
 		return data[12:16], map[string]bool{"SIMPLE_ACK": true}, nil
 	}
 	if ansType == rpcUnknown {
@@ -461,9 +502,10 @@ func newProxyReqWriter(upstream proto.StreamWriter, clIP string, clPort int,
 }
 
 // encodeIPPort 将 IP:port 编码为 MTProto 中间代理协议所需的格式：
-//   IPv4：[0×10 零字节][0xff][0xff][4字节IPv4][4字节端口] = 16 字节
-//         前 10 字节为零是 IPv4-mapped IPv6 地址的标准前缀（RFC 4291 §2.5.5.2）
-//   IPv6：[16字节IPv6][4字节端口] = 20 字节
+//
+//	IPv4：[0×10 零字节][0xff][0xff][4字节IPv4][4字节端口] = 20 字节
+//	      前 10 字节为零是 IPv4-mapped IPv6 地址的标准前缀（RFC 4291 §2.5.5.2）
+//	IPv6：[16字节IPv6][4字节端口] = 20 字节
 func encodeIPPort(ip string, port int) []byte {
 	parsed := net.ParseIP(ip)
 	portBytes := make([]byte, 4)

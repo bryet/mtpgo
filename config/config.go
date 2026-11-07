@@ -1,20 +1,22 @@
 package config
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"mtproxy/version"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"gopkg.in/ini.v1"
-)
+	"time"
 
-// ── 握手参数常量 ──────────────────────────────────────────────────────────────
+	"gopkg.in/ini.v1"
+	"mtproxy/version"
+)
 
 const (
 	SkipLen      = 8
@@ -26,17 +28,11 @@ const (
 	DCIdxPos     = 60
 )
 
-// ── 配置结构体 ────────────────────────────────────────────────────────────────
-
-type Modes struct {
-	Classic bool
-	Secure  bool
-	TLS     bool
-}
+type Modes struct{ Classic, Secure, TLS bool }
 
 type Config struct {
 	Port      int
-	Secrets   [][]byte // 所有 secret，每个 16 字节
+	Secrets   [][]byte
 	ADTag     []byte
 	Modes     Modes
 	TLSDomain string
@@ -45,16 +41,14 @@ type Config struct {
 	PreferIPv6     bool
 	FastMode       bool
 	ProxyProtocol  bool
+	Mask           bool
+	MaskHost       string
+	MaskPort       int
+	MyDomain       string
 
-	Mask     bool
-	MaskHost string
-	MaskPort int
-	MyDomain string
-
-	ListenAddrIPv4 string
-	ListenAddrIPv6 string
-	ListenUnixSock string
-
+	ListenAddrIPv4      string
+	ListenAddrIPv6      string
+	ListenUnixSock      string
 	MetricsPort         int
 	MetricsListenAddrV4 string
 	MetricsListenAddrV6 string
@@ -63,7 +57,6 @@ type Config struct {
 	MetricsExportLinks  bool
 
 	ReplayCheckLen         int
-	ClientIPsLen           int
 	StatsPrintPeriod       int
 	ProxyInfoUpdatePeriod  int
 	GetCertLenPeriod       int
@@ -73,30 +66,21 @@ type Config struct {
 	ClientKeepalive        int
 	ClientAckTimeout       int
 	IgnoreTimeSkew         bool
-	LogLevel               string // debug / info / warn / error
+	LogLevel               string
 }
 
-// ── 并发安全的配置持有者 ──────────────────────────────────────────────────────
-
-// AtomicConfig 用 RWMutex 保护 Config 的并发读写，解决热重载时的数据竞争。
-// 所有 goroutine 通过 Get() 获取当前配置快照，热重载通过 Set() 原子替换。
+// Config snapshots are immutable after publication, including their slices.
 type AtomicConfig struct {
 	mu  sync.RWMutex
 	cfg *Config
 }
 
-func NewAtomicConfig(cfg *Config) *AtomicConfig {
-	return &AtomicConfig{cfg: cfg}
-}
-
-// Get 返回当前配置的指针（只读，调用方不得修改）。
+func NewAtomicConfig(cfg *Config) *AtomicConfig { return &AtomicConfig{cfg: cfg} }
 func (a *AtomicConfig) Get() *Config {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.cfg
 }
-
-// Set 原子替换配置，热重载时调用。
 func (a *AtomicConfig) Set(cfg *Config) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -104,227 +88,267 @@ func (a *AtomicConfig) Set(cfg *Config) {
 }
 
 var secretHexRe = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var metricPrefixRe = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
+
+func DefaultConfig() *Config {
+	return &Config{
+		Port: 3256, TLSDomain: "www.google.com", Modes: Modes{true, true, true},
+		Mask: true, MaskPort: 443, ListenAddrIPv4: "0.0.0.0", ListenAddrIPv6: "::",
+		MetricsListenAddrV4: "127.0.0.1", MetricsListenAddrV6: "::1", MetricsPrefix: "mtproxy_",
+		MetricsWhitelist: []string{"127.0.0.1", "::1"}, ReplayCheckLen: 65536,
+		StatsPrintPeriod: 60, ProxyInfoUpdatePeriod: 3600, GetCertLenPeriod: 14400,
+		TGConnectTimeout: 10, TGReadTimeout: 60, ClientHandshakeTimeout: 10,
+		ClientKeepalive: 10, ClientAckTimeout: 10, FastMode: true, LogLevel: "info",
+	}
+}
 
 func LoadConfig(path string) (*Config, error) {
-	cfg := &Config{
-		Port:      3256,
-		TLSDomain: "www.google.com",
-		Modes:     Modes{Classic: true, Secure: true, TLS: true},
-
-		Mask:     true,
-		MaskPort: 443,
-
-		ListenAddrIPv4: "0.0.0.0",
-		ListenAddrIPv6: "::",
-
-		MetricsPrefix: "mtproxy_",
-
-		ReplayCheckLen:         65536,
-		ClientIPsLen:           131072,
-		StatsPrintPeriod:       60,
-		ProxyInfoUpdatePeriod:  60 * 60,
-		GetCertLenPeriod:       4 * 60 * 60,
-		TGConnectTimeout:       10,
-		TGReadTimeout:          60,
-		ClientHandshakeTimeout: 10,
-		ClientKeepalive:        10,
-		ClientAckTimeout:       10,
-		FastMode:               true,
-		LogLevel:               "info",
-	}
-
+	cfg := DefaultConfig()
 	f, err := ini.Load(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
-
 	sec := f.Section("")
-
-	if key, err2 := sec.GetKey("PORT"); err2 == nil {
-		cfg.Port, _ = key.Int()
+	ints := map[string]*int{
+		"PORT": &cfg.Port, "MASK_PORT": &cfg.MaskPort, "METRICS_PORT": &cfg.MetricsPort,
+		"REPLAY_CHECK_LEN": &cfg.ReplayCheckLen, "STATS_PRINT_PERIOD": &cfg.StatsPrintPeriod,
+		"PROXY_INFO_UPDATE_PERIOD": &cfg.ProxyInfoUpdatePeriod, "GET_CERT_LEN_PERIOD": &cfg.GetCertLenPeriod,
+		"TG_CONNECT_TIMEOUT": &cfg.TGConnectTimeout, "TG_READ_TIMEOUT": &cfg.TGReadTimeout,
+		"CLIENT_HANDSHAKE_TIMEOUT": &cfg.ClientHandshakeTimeout, "CLIENT_KEEPALIVE": &cfg.ClientKeepalive,
+		"CLIENT_ACK_TIMEOUT": &cfg.ClientAckTimeout,
 	}
-	if key, err2 := sec.GetKey("TLS_DOMAIN"); err2 == nil {
-		cfg.TLSDomain = strings.Trim(key.String(), `"'`)
+	bools := map[string]*bool{
+		"MASK": &cfg.Mask, "FAST_MODE": &cfg.FastMode, "PREFER_IPV6": &cfg.PreferIPv6,
+		"PROXY_PROTOCOL": &cfg.ProxyProtocol, "IGNORE_TIME_SKEW": &cfg.IgnoreTimeSkew,
+		"METRICS_EXPORT_LINKS": &cfg.MetricsExportLinks, "MODES_CLASSIC": &cfg.Modes.Classic,
+		"MODES_SECURE": &cfg.Modes.Secure, "MODES_TLS": &cfg.Modes.TLS,
 	}
-	if key, err2 := sec.GetKey("MASK_HOST"); err2 == nil {
-		cfg.MaskHost = key.String()
+	strs := map[string]*string{
+		"TLS_DOMAIN": &cfg.TLSDomain, "MASK_HOST": &cfg.MaskHost, "MY_DOMAIN": &cfg.MyDomain,
+		"LISTEN_ADDR_IPV4": &cfg.ListenAddrIPv4, "LISTEN_ADDR_IPV6": &cfg.ListenAddrIPv6,
+		"LISTEN_UNIX_SOCK": &cfg.ListenUnixSock, "METRICS_LISTEN_ADDR_IPV4": &cfg.MetricsListenAddrV4,
+		"METRICS_LISTEN_ADDR_IPV6": &cfg.MetricsListenAddrV6, "METRICS_PREFIX": &cfg.MetricsPrefix,
+		"LOG_LEVEL": &cfg.LogLevel,
 	}
-	if key, err2 := sec.GetKey("MY_DOMAIN"); err2 == nil {
-		cfg.MyDomain = key.String()
-	}
-	if key, err2 := sec.GetKey("MASK_PORT"); err2 == nil {
-		cfg.MaskPort, _ = key.Int()
-	}
-	if key, err2 := sec.GetKey("MASK"); err2 == nil {
-		cfg.Mask, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("FAST_MODE"); err2 == nil {
-		cfg.FastMode, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("PREFER_IPV6"); err2 == nil {
-		cfg.PreferIPv6, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("PROXY_PROTOCOL"); err2 == nil {
-		cfg.ProxyProtocol, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("IGNORE_TIME_SKEW"); err2 == nil {
-		cfg.IgnoreTimeSkew, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("LOG_LEVEL"); err2 == nil {
-		v := strings.ToLower(strings.TrimSpace(key.String()))
-		switch v {
-		case "debug", "info", "warn", "error":
-			cfg.LogLevel = v
-		default:
-			return nil, fmt.Errorf("LOG_LEVEL 无效值 %q，支持: debug/info/warn/error", v)
-		}
-	}
-	if key, err2 := sec.GetKey("LISTEN_ADDR_IPV4"); err2 == nil {
-		cfg.ListenAddrIPv4 = key.String()
-	}
-	if key, err2 := sec.GetKey("LISTEN_ADDR_IPV6"); err2 == nil {
-		cfg.ListenAddrIPv6 = key.String()
-	}
-	if key, err2 := sec.GetKey("LISTEN_UNIX_SOCK"); err2 == nil {
-		cfg.ListenUnixSock = key.String()
-	}
-	if key, err2 := sec.GetKey("METRICS_PORT"); err2 == nil {
-		cfg.MetricsPort, _ = key.Int()
-	}
-	if key, err2 := sec.GetKey("METRICS_LISTEN_ADDR_IPV4"); err2 == nil {
-		cfg.MetricsListenAddrV4 = key.String()
-	}
-	if key, err2 := sec.GetKey("METRICS_LISTEN_ADDR_IPV6"); err2 == nil {
-		cfg.MetricsListenAddrV6 = key.String()
-	}
-	if key, err2 := sec.GetKey("METRICS_PREFIX"); err2 == nil {
-		cfg.MetricsPrefix = key.String()
-	}
-	if key, err2 := sec.GetKey("METRICS_EXPORT_LINKS"); err2 == nil {
-		cfg.MetricsExportLinks, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("REPLAY_CHECK_LEN"); err2 == nil {
-		cfg.ReplayCheckLen, _ = key.Int()
-	}
-	if key, err2 := sec.GetKey("CLIENT_IPS_LEN"); err2 == nil {
-		cfg.ClientIPsLen, _ = key.Int()
-	}
-	if key, err2 := sec.GetKey("STATS_PRINT_PERIOD"); err2 == nil {
-		cfg.StatsPrintPeriod, _ = key.Int()
-	}
-	if key, err2 := sec.GetKey("AD_TAG"); err2 == nil {
-		tag, e := hex.DecodeString(key.String())
-		if e == nil {
-			cfg.ADTag = tag
-		}
-	}
-	if key, err2 := sec.GetKey("METRICS_WHITELIST"); err2 == nil {
-		for _, entry := range strings.Split(key.String(), ",") {
-			if e := strings.TrimSpace(entry); e != "" {
-				cfg.MetricsWhitelist = append(cfg.MetricsWhitelist, e)
+	for _, key := range sec.Keys() {
+		name := key.Name()
+		if dest, ok := ints[name]; ok {
+			*dest, err = key.Int()
+		} else if dest, ok := bools[name]; ok {
+			*dest, err = key.Bool()
+		} else if dest, ok := strs[name]; ok {
+			*dest = strings.Trim(strings.TrimSpace(key.String()), `"'`)
+		} else {
+			switch name {
+			case "SECRET":
+				for _, s := range strings.Split(key.String(), ",") {
+					s = strings.TrimSpace(s)
+					if !secretHexRe.MatchString(s) {
+						return nil, fmt.Errorf("SECRET 必须由 32 位十六进制密钥组成")
+					}
+					s = strings.ToLower(s)
+					if s == "00000000000000000000000000000000" || s == "00000000000000000000000000000001" || s == "0123456789abcdef0123456789abcdef" {
+						return nil, fmt.Errorf("SECRET 是公开的示例密钥，请先运行 mtpgo -s 生成随机密钥")
+					}
+					b, _ := hex.DecodeString(s)
+					for _, old := range cfg.Secrets {
+						if hex.EncodeToString(old) == s {
+							return nil, fmt.Errorf("SECRET 不能重复")
+						}
+					}
+					cfg.Secrets = append(cfg.Secrets, b)
+				}
+			case "AD_TAG":
+				cfg.ADTag, err = hex.DecodeString(strings.TrimSpace(key.String()))
+				if err == nil && len(cfg.ADTag) != 0 && len(cfg.ADTag) != 16 {
+					err = fmt.Errorf("必须是 32 位十六进制字符")
+				}
+			case "METRICS_WHITELIST":
+				cfg.MetricsWhitelist = nil
+				for _, s := range strings.Split(key.String(), ",") {
+					if s = strings.TrimSpace(s); s != "" {
+						cfg.MetricsWhitelist = append(cfg.MetricsWhitelist, s)
+					}
+				}
+			case "CLIENT_IPS_LEN":
+				return nil, fmt.Errorf("CLIENT_IPS_LEN 从未实现，已移除，请删除此配置项")
+			default:
+				return nil, fmt.Errorf("未知配置项 %s", name)
 			}
 		}
-	}
-
-	// 读取 MODES
-	if key, err2 := sec.GetKey("MODES_CLASSIC"); err2 == nil {
-		cfg.Modes.Classic, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("MODES_SECURE"); err2 == nil {
-		cfg.Modes.Secure, _ = key.Bool()
-	}
-	if key, err2 := sec.GetKey("MODES_TLS"); err2 == nil {
-		cfg.Modes.TLS, _ = key.Bool()
-	}
-
-	// 读取 SECRET（支持逗号分隔多个 32 位 hex 字符串）
-	if key, err2 := sec.GetKey("SECRET"); err2 == nil {
-		for _, s := range strings.Split(key.String(), ",") {
-			s = strings.TrimSpace(s)
-			if secretHexRe.MatchString(s) {
-				b, _ := hex.DecodeString(s)
-				cfg.Secrets = append(cfg.Secrets, b)
-			}
+		if err != nil {
+			return nil, fmt.Errorf("%s 无效: %w", name, err)
 		}
+	}
+	if len(f.Sections()) > 1 {
+		return nil, fmt.Errorf("配置项必须放在默认节中")
 	}
 	if len(cfg.Secrets) == 0 {
-		b, _ := hex.DecodeString("00000000000000000000000000000000")
-		cfg.Secrets = append(cfg.Secrets, b)
-		fmt.Fprintln(os.Stderr, "警告: 未找到 secret，使用默认值")
+		return nil, fmt.Errorf("缺少 SECRET，请运行 mtpgo -s 生成随机密钥")
 	}
-
-	// 范围校验：端口
-	if cfg.Port < 1 || cfg.Port > 65535 {
-		return nil, fmt.Errorf("PORT %d 超出有效范围 1-65535", cfg.Port)
+	cfg.LogLevel = strings.ToLower(cfg.LogLevel)
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return nil, fmt.Errorf("LOG_LEVEL 必须是 debug/info/warn/error")
 	}
-	if cfg.MaskPort < 1 || cfg.MaskPort > 65535 {
-		return nil, fmt.Errorf("MASK_PORT %d 超出有效范围 1-65535", cfg.MaskPort)
+	for name, value := range map[string]int{"PORT": cfg.Port, "MASK_PORT": cfg.MaskPort} {
+		if value < 1 || value > 65535 {
+			return nil, fmt.Errorf("%s 超出 1-65535", name)
+		}
 	}
-	// 范围校验：超时（秒）
-	if cfg.ClientHandshakeTimeout < 1 {
-		return nil, fmt.Errorf("CLIENT_HANDSHAKE_TIMEOUT 不能小于 1 秒")
+	if cfg.MetricsPort < 0 || cfg.MetricsPort > 65535 {
+		return nil, fmt.Errorf("METRICS_PORT 超出 0-65535")
 	}
-	if cfg.TGReadTimeout < 1 {
-		return nil, fmt.Errorf("TG_READ_TIMEOUT 不能小于 1 秒")
+	for name, value := range ints {
+		if strings.Contains(name, "TIMEOUT") || strings.Contains(name, "PERIOD") || name == "CLIENT_KEEPALIVE" {
+			if *value < 1 || *value > 86400 {
+				return nil, fmt.Errorf("%s 必须为 1-86400 秒", name)
+			}
+		}
 	}
-
-	// 默认值推导
+	if cfg.ReplayCheckLen < 0 || cfg.ReplayCheckLen > 1<<20 {
+		return nil, fmt.Errorf("REPLAY_CHECK_LEN 必须为 0-1048576")
+	}
+	if !cfg.Modes.Classic && !cfg.Modes.Secure && !cfg.Modes.TLS {
+		return nil, fmt.Errorf("至少启用一种代理模式")
+	}
 	if cfg.MaskHost == "" {
 		cfg.MaskHost = cfg.TLSDomain
 	}
+	if !validHost(cfg.TLSDomain) || !validHost(cfg.MaskHost) || (cfg.MyDomain != "" && !validHost(cfg.MyDomain)) {
+		return nil, fmt.Errorf("TLS_DOMAIN、MASK_HOST 或 MY_DOMAIN 不是有效主机名/IP")
+	}
+	for name, value := range map[string]string{"LISTEN_ADDR_IPV4": cfg.ListenAddrIPv4, "METRICS_LISTEN_ADDR_IPV4": cfg.MetricsListenAddrV4} {
+		if value != "" && (net.ParseIP(value) == nil || net.ParseIP(value).To4() == nil) {
+			return nil, fmt.Errorf("%s 必须是 IPv4 地址或空字符串", name)
+		}
+	}
+	for name, value := range map[string]string{"LISTEN_ADDR_IPV6": cfg.ListenAddrIPv6, "METRICS_LISTEN_ADDR_IPV6": cfg.MetricsListenAddrV6} {
+		if value != "" && (net.ParseIP(value) == nil || net.ParseIP(value).To4() != nil) {
+			return nil, fmt.Errorf("%s 必须是 IPv6 地址或空字符串", name)
+		}
+	}
+	if cfg.ListenAddrIPv4 == "" && cfg.ListenAddrIPv6 == "" && cfg.ListenUnixSock == "" {
+		return nil, fmt.Errorf("至少设置一个监听地址")
+	}
+	if cfg.ListenUnixSock != "" && !filepath.IsAbs(cfg.ListenUnixSock) {
+		return nil, fmt.Errorf("LISTEN_UNIX_SOCK 必须为绝对路径")
+	}
+	if cfg.MetricsPort != 0 && cfg.MetricsListenAddrV4 == "" && cfg.MetricsListenAddrV6 == "" {
+		return nil, fmt.Errorf("启用指标时必须设置指标监听地址")
+	}
+	if cfg.MetricsPrefix != "" && !metricPrefixRe.MatchString(cfg.MetricsPrefix) {
+		return nil, fmt.Errorf("METRICS_PREFIX 无效")
+	}
+	for _, s := range cfg.MetricsWhitelist {
+		if net.ParseIP(s) == nil {
+			if _, _, err := net.ParseCIDR(s); err != nil {
+				return nil, fmt.Errorf("METRICS_WHITELIST 无效: %s", s)
+			}
+		}
+	}
 	cfg.UseMiddleProxy = len(cfg.ADTag) == 16
-
 	return cfg, nil
 }
 
-func ParseArgs() (configPath string) {
-	defaultConfig := filepath.Join(filepath.Dir(os.Args[0]), "config.ini")
-
-	var cfgPath string
-	var genSecret bool
-	var showHelp bool
-	var showVersion bool
-
-	flag.StringVar(&cfgPath, "c", defaultConfig, "")
-	flag.StringVar(&cfgPath, "config", defaultConfig, "")
-	flag.BoolVar(&genSecret, "s", false, "")
-	flag.BoolVar(&genSecret, "secret", false, "")
-	flag.BoolVar(&showHelp, "h", false, "")
-	flag.BoolVar(&showHelp, "help", false, "")
-	flag.BoolVar(&showVersion, "v", false, "")
-	flag.BoolVar(&showVersion, "version", false, "")
-
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  -h, --help          显示帮助信息\n")
-		fmt.Fprintf(os.Stderr, "  -s, --secret        生成随机 32 位 hex 密钥\n")
-		fmt.Fprintf(os.Stderr, "  -c, --config        指定配置文件路径 (默认: <程序目录>/config.ini)\n")
-		fmt.Fprintf(os.Stderr, "  -v, --version       查看版本号\n")
+func validHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
 	}
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
 
+// Listener changes cannot be applied atomically without dropping existing binds.
+func ValidateReload(old, next *Config) error {
+	if old.Port != next.Port || old.ListenAddrIPv4 != next.ListenAddrIPv4 || old.ListenAddrIPv6 != next.ListenAddrIPv6 || old.ListenUnixSock != next.ListenUnixSock || old.MetricsPort != next.MetricsPort || old.MetricsListenAddrV4 != next.MetricsListenAddrV4 || old.MetricsListenAddrV6 != next.MetricsListenAddrV6 {
+		return fmt.Errorf("监听端口/地址变更需要重启；本次重载未应用任何变更")
+	}
+	return nil
+}
+
+// RunPeriodic responds to cancellation and new immutable configuration snapshots.
+// A one-second check bounds reload latency without resetting the task's timer on
+// every tick. initial=false is useful for delayed statistics output.
+func RunPeriodic(ctx context.Context, a *AtomicConfig, interval func(*Config) time.Duration, initial bool, task func(context.Context, *Config)) {
+	cfg := a.Get()
+	next := time.Now().Add(interval(cfg))
+	if initial {
+		task(ctx, cfg)
+		next = time.Now().Add(interval(cfg))
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			latest := a.Get()
+			if latest != cfg || !time.Now().Before(next) {
+				cfg = latest
+				task(ctx, cfg)
+				next = time.Now().Add(interval(cfg))
+			}
+		}
+	}
+}
+
+func ParseArgs() string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+	defaultConfig := filepath.Join(filepath.Dir(exe), "config.ini")
+	var cfgPath string
+	var genSecret, showHelp, showVersion, checkConfig bool
+	flag.StringVar(&cfgPath, "c", defaultConfig, "配置文件路径")
+	flag.StringVar(&cfgPath, "config", defaultConfig, "配置文件路径")
+	flag.BoolVar(&genSecret, "s", false, "生成随机密钥")
+	flag.BoolVar(&genSecret, "secret", false, "生成随机密钥")
+	flag.BoolVar(&showHelp, "h", false, "显示帮助")
+	flag.BoolVar(&showHelp, "help", false, "显示帮助")
+	flag.BoolVar(&showVersion, "v", false, "查看版本")
+	flag.BoolVar(&showVersion, "version", false, "查看版本")
+	flag.BoolVar(&checkConfig, "check", false, "验证配置后退出，不连接网络")
 	flag.Parse()
-
 	if showHelp {
 		flag.Usage()
 		os.Exit(0)
 	}
-
 	if showVersion {
 		fmt.Println(version.String())
 		os.Exit(0)
 	}
-
 	if genSecret {
-		// 修复：使用 crypto/rand 替代 os.Open("/dev/urandom")，跨平台且正确处理错误
 		b := make([]byte, 16)
 		if _, err := rand.Read(b); err != nil {
-			fmt.Fprintf(os.Stderr, "生成随机 secret 失败: %v\n", err)
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		fmt.Println(hex.EncodeToString(b))
 		os.Exit(0)
 	}
-
+	if checkConfig {
+		if _, err := LoadConfig(cfgPath); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("配置有效")
+		os.Exit(0)
+	}
 	return cfgPath
 }

@@ -81,6 +81,9 @@ type MtprotoFrameWriter struct {
 }
 
 func (w *MtprotoFrameWriter) Write(msg []byte, extra map[string]bool) error {
+	if len(msg) > MaxMsgLen-12 || len(msg)%4 != 0 {
+		return fmt.Errorf("invalid frame payload length: %d", len(msg))
+	}
 	// 预计算总长度，一次性分配，避免多次 append 拷贝
 	// frame = len(4) + seq(4) + msg + crc32(4)，再对齐到 CBCPadding
 	baseLen := 4 + 4 + len(msg) + 4
@@ -145,6 +148,9 @@ func (r *MtprotoCompactReader) Read(bufSize int) ([]byte, map[string]bool, error
 		msgLen = int(ext[0]) | int(ext[1])<<8 | int(ext[2])<<16
 	}
 	msgLen *= 4
+	if err := validatePayloadLen(msgLen, false); err != nil {
+		return nil, nil, err
+	}
 	data, err := r.Upstream.ReadExactly(msgLen)
 	return data, extra, err
 }
@@ -152,6 +158,12 @@ func (r *MtprotoCompactReader) Read(bufSize int) ([]byte, map[string]bool, error
 type MtprotoCompactWriter struct{ Upstream StreamWriter }
 
 func (w *MtprotoCompactWriter) Write(data []byte, extra map[string]bool) error {
+	if err := validatePayloadLen(len(data), false); err != nil {
+		return err
+	}
+	if extra != nil && extra["SIMPLE_ACK"] && len(data) != 4 {
+		return fmt.Errorf("invalid quick ack length")
+	}
 	if extra != nil && extra["SIMPLE_ACK"] {
 		rev := make([]byte, len(data))
 		for i, b := range data {
@@ -191,9 +203,12 @@ func (r *MtprotoIntermediateReader) Read(bufSize int) ([]byte, map[string]bool, 
 	}
 	msgLen := binary.LittleEndian.Uint32(hdr)
 	extra := map[string]bool{}
-	if msgLen > 0x80000000 {
+	if msgLen&0x80000000 != 0 {
 		extra["QUICKACK_FLAG"] = true
-		msgLen -= 0x80000000
+		msgLen &^= 0x80000000
+	}
+	if err := validatePayloadLen(int(msgLen), false); err != nil {
+		return nil, nil, err
 	}
 	data, err := r.Upstream.ReadExactly(int(msgLen))
 	return data, extra, err
@@ -202,6 +217,12 @@ func (r *MtprotoIntermediateReader) Read(bufSize int) ([]byte, map[string]bool, 
 type MtprotoIntermediateWriter struct{ Upstream StreamWriter }
 
 func (w *MtprotoIntermediateWriter) Write(data []byte, extra map[string]bool) error {
+	if err := validatePayloadLen(len(data), false); err != nil {
+		return err
+	}
+	if extra != nil && extra["SIMPLE_ACK"] && len(data) != 4 {
+		return fmt.Errorf("invalid quick ack length")
+	}
 	if extra != nil && extra["SIMPLE_ACK"] {
 		return w.Upstream.Write(data, nil)
 	}
@@ -232,11 +253,14 @@ func (r *MtprotoSecureReader) Read(bufSize int) ([]byte, map[string]bool, error)
 	}
 	raw := binary.LittleEndian.Uint32(hdr)
 	extra := map[string]bool{}
-	if raw > 0x80000000 {
+	if raw&0x80000000 != 0 {
 		extra["QUICKACK_FLAG"] = true
-		raw -= 0x80000000
+		raw &^= 0x80000000
 	}
 	msgLen := int(raw)
+	if err := validatePayloadLen(msgLen, true); err != nil {
+		return nil, nil, err
+	}
 	data, err := r.Upstream.ReadExactly(msgLen)
 	if err != nil {
 		return nil, nil, err
@@ -250,6 +274,12 @@ func (r *MtprotoSecureReader) Read(bufSize int) ([]byte, map[string]bool, error)
 type MtprotoSecureWriter struct{ Upstream StreamWriter }
 
 func (w *MtprotoSecureWriter) Write(data []byte, extra map[string]bool) error {
+	if err := validatePayloadLen(len(data), false); err != nil {
+		return err
+	}
+	if extra != nil && extra["SIMPLE_ACK"] && len(data) != 4 {
+		return fmt.Errorf("invalid quick ack length")
+	}
 	if extra != nil && extra["SIMPLE_ACK"] {
 		return w.Upstream.Write(data, nil)
 	}
@@ -265,3 +295,16 @@ func (w *MtprotoSecureWriter) Drain() error      { return w.Upstream.Drain() }
 func (w *MtprotoSecureWriter) Close()            { w.Upstream.Close() }
 func (w *MtprotoSecureWriter) Abort()            { w.Upstream.Abort() }
 func (w *MtprotoSecureWriter) GetConn() net.Conn { return w.Upstream.GetConn() }
+
+// Validate before allocating attacker-controlled payload lengths. Secure mode
+// allows up to three padding bytes after the aligned MTProto payload.
+func validatePayloadLen(n int, padded bool) error {
+	limit := MaxMsgLen
+	if padded {
+		limit += 3
+	}
+	if n < 4 || n > limit || (!padded && n%4 != 0) {
+		return fmt.Errorf("invalid payload length: %d", n)
+	}
+	return nil
+}

@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"mtproxy/config"
+	"mtproxy/proxy"
+	"mtproxy/stats"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,10 +19,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"mtproxy/config"
-	"mtproxy/crypto"
-	"mtproxy/proxy"
-	"mtproxy/stats"
 )
 
 // ── 日志 ──────────────────────────────────────────────────────────────────────
@@ -26,10 +27,14 @@ var logWriter io.Writer = os.Stderr
 var logFile *os.File
 
 func setupLogger() {
-	logDir := filepath.Dir(os.Args[0])
+	exe, _ := os.Executable()
+	logDir := os.Getenv("MTPGO_LOG_DIR")
+	if logDir == "" {
+		logDir = filepath.Dir(exe)
+	}
 	logPath := filepath.Join(logDir, "log_mtpgo")
 	var err error
-	logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "无法创建日志文件 %s: %v\n", logPath, err)
 		return
@@ -38,12 +43,12 @@ func setupLogger() {
 }
 
 func logf(format string, args ...interface{}) {
-	fmt.Fprintf(logWriter, format, args...)
+	proxy.Logf(format, args...)
 }
 
-func infof(format string, args ...interface{})  { fmt.Fprintf(logWriter, "[INFO]  "+format, args...) }
-func warnf(format string, args ...interface{})  { fmt.Fprintf(logWriter, "[WARN]  "+format, args...) }
-func errorf(format string, args ...interface{}) { fmt.Fprintf(logWriter, "[ERROR] "+format, args...) }
+func infof(format string, args ...interface{})  { proxy.Infof(format, args...) }
+func warnf(format string, args ...interface{})  { proxy.Warnf(format, args...) }
+func errorf(format string, args ...interface{}) { proxy.Errorf(format, args...) }
 
 // ── 获取公网 IP（遍历所有网口）─────────────────────────────────────────────────
 
@@ -70,10 +75,14 @@ func newHTTPClient(network, iface string) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	if iface != "" {
 		dialer.Control = func(net_, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-					syscall.SO_BINDTODEVICE, iface)
+			var sockErr error
+			err := c.Control(func(fd uintptr) {
+				sockErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
 			})
+			if err != nil {
+				return err
+			}
+			return sockErr
 		}
 	}
 	return &http.Client{
@@ -112,7 +121,7 @@ func getFirstIPConcurrent(client *http.Client, urls []string) string {
 				ch <- result{""}
 				return
 			}
-			body, err := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
 			if err != nil {
 				ch <- result{""}
 				return
@@ -142,6 +151,7 @@ func getIPWithFallback(urls []string, ifaces []string, isIPv6 bool) string {
 			network = "tcp6"
 		}
 		client := newHTTPClient(network, iface)
+		defer client.CloseIdleConnections()
 		if ip := getFirstIPConcurrent(client, urls); ip != "" {
 			return ip
 		}
@@ -152,6 +162,7 @@ func getIPWithFallback(urls []string, ifaces []string, isIPv6 bool) string {
 		network = "tcp6"
 	}
 	client := newHTTPClient(network, "")
+	defer client.CloseIdleConnections()
 	return getFirstIPConcurrent(client, urls)
 }
 
@@ -163,12 +174,12 @@ func initIPInfo(cfg *config.Config) {
 	}
 
 	ipURLs := []string{
-		"http://ip.gs",
-		"http://ip.sb",
-		"http://ident.me",
-		"http://ifconfig.me",
-		"http://api.ipify.org",
-		"http://icanhazip.com",
+		"https://ip.gs",
+		"https://ip.sb",
+		"https://ident.me",
+		"https://ifconfig.me",
+		"https://api.ipify.org",
+		"https://icanhazip.com",
 	}
 
 	// 获取 IPv4：遍历所有网口
@@ -192,216 +203,205 @@ func initIPInfo(cfg *config.Config) {
 
 // ── 打印代理链接 ──────────────────────────────────────────────────────────────
 
-func printTGInfo(cfg *config.Config) []map[string]string {
+func buildProxyLinks(cfg *config.Config) []map[string]string {
 	ipv4, ipv6 := proxy.MyIPInfo.Get()
-	var ipAddrs []string
-
+	hosts := []string{}
 	if cfg.MyDomain != "" {
-		ipAddrs = []string{cfg.MyDomain}
+		hosts = append(hosts, cfg.MyDomain)
 	} else {
 		if ipv4 != "" {
-			ipAddrs = append(ipAddrs, ipv4)
+			hosts = append(hosts, ipv4)
 		}
 		if ipv6 != "" {
-			ipAddrs = append(ipAddrs, ipv6)
-		}
-		if len(ipAddrs) == 0 {
-			warnf("Warning: could not determine public IP\n")
-			return nil
+			hosts = append(hosts, ipv6)
 		}
 	}
-
-	defaultSecrets := map[string]bool{
-		"00000000000000000000000000000000": true,
-		"0123456789abcdef0123456789abcdef": true,
-		"00000000000000000000000000000001": true,
-	}
-
 	var links []map[string]string
-	printDefault := false
-
 	for _, secret := range cfg.Secrets {
-		secretHex := hex.EncodeToString(secret)
-		for _, ip := range ipAddrs {
-			if cfg.Modes.Classic {
-				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=%s",
-					ip, cfg.Port, secretHex)
-				links = append(links, map[string]string{"secret": secretHex, "link": link})
-				infof("\033[31mMtproxyurl: %s\033[0m\n", link)
-			}
-			if cfg.Modes.Secure {
-				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=dd%s",
-					ip, cfg.Port, secretHex)
-				links = append(links, map[string]string{"secret": secretHex, "link": link})
-				infof("\033[31mMtproxyurl: %s\033[0m\n", link)
-			}
-			if cfg.Modes.TLS {
-				tlsSecret := "ee" + secretHex + hex.EncodeToString([]byte(cfg.TLSDomain))
-				link := fmt.Sprintf("https://t.me/proxy?server=%s&port=%d&secret=%s",
-					ip, cfg.Port, tlsSecret)
-				links = append(links, map[string]string{"secret": secretHex, "link": link})
-				infof("\033[31mMtproxyurl: %s\033[0m\n", link)
+		base := hex.EncodeToString(secret)
+		var secrets []string
+		if cfg.Modes.Classic {
+			secrets = append(secrets, base)
+		}
+		if cfg.Modes.Secure {
+			secrets = append(secrets, "dd"+base)
+		}
+		if cfg.Modes.TLS {
+			secrets = append(secrets, "ee"+base+hex.EncodeToString([]byte(cfg.TLSDomain)))
+		}
+		for _, host := range hosts {
+			for _, sec := range secrets {
+				values := url.Values{"server": {host}, "port": {fmt.Sprint(cfg.Port)}, "secret": {sec}}
+				links = append(links, map[string]string{"secret": base, "link": "https://t.me/proxy?" + values.Encode()})
 			}
 		}
-		if defaultSecrets[secretHex] {
-			warnf("The default secret %s is used, this is not recommended\n", secretHex)
-			rnd := crypto.GlobalRand.Bytes(16)
-			infof("You can change it to this random secret: %s\n", hex.EncodeToString(rnd))
-			printDefault = true
-		}
-	}
-
-	if cfg.TLSDomain == "www.google.com" {
-		warnf("The default TLS_DOMAIN www.google.com is used, this is not recommended\n")
-		printDefault = true
-	}
-	if printDefault {
-		warnf("Warning: one or more default settings detected\n")
 	}
 	return links
+}
+func printTGInfo(cfg *config.Config) {
+	links := buildProxyLinks(cfg)
+	if len(links) == 0 {
+		warnf("Could not determine public IP; set MY_DOMAIN to advertise a hostname\n")
+	}
+	// Links contain credentials: print to the interactive terminal only, not the
+	// persistent log or journal. Metrics export is a separate explicit opt-in.
+	if fi, err := os.Stdout.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		for _, link := range links {
+			fmt.Fprintf(os.Stdout, "Mtproxyurl: %s\n", link["link"])
+		}
+	}
 }
 
 // ── 服务器启动 ────────────────────────────────────────────────────────────────
 
 const shutdownTimeout = 5 * time.Second
 
-func acceptLoop(ln net.Listener, acfg *config.AtomicConfig, wg *sync.WaitGroup) {
+type connectionGroup struct {
+	mu      sync.Mutex
+	conns   map[net.Conn]struct{}
+	closing bool
+	wg      sync.WaitGroup
+}
+
+func (g *connectionGroup) add(c net.Conn) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closing {
+		return false
+	}
+	g.conns[c] = struct{}{}
+	g.wg.Add(1)
+	return true
+}
+func (g *connectionGroup) done(c net.Conn) {
+	g.mu.Lock()
+	delete(g.conns, c)
+	g.mu.Unlock()
+	g.wg.Done()
+}
+func (g *connectionGroup) closeAll() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closing = true
+	for c := range g.conns {
+		c.Close()
+	}
+}
+func acceptLoop(ln net.Listener, a *config.AtomicConfig, g *connectionGroup, acceptWG *sync.WaitGroup) {
+	defer acceptWG.Done()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				errorf("Accept failed: %v\n", err)
+			}
 			return
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			proxy.HandleClientWrapper(conn, acfg.Get())
-		}()
+		if !g.add(conn) {
+			conn.Close()
+			continue
+		}
+		cfg := a.Get()
+		go func() { defer g.done(conn); proxy.HandleClientWrapper(conn, cfg) }()
 	}
 }
-
-func startServers(acfg *config.AtomicConfig, wg *sync.WaitGroup) []io.Closer {
-	cfg := acfg.Get()
-	var listeners []io.Closer
-
-	if cfg.ListenAddrIPv4 != "" {
-		addr := fmt.Sprintf("%s:%d", cfg.ListenAddrIPv4, cfg.Port)
-		ln, err := net.Listen("tcp4", addr)
-		if err != nil {
-			errorf("Failed to listen on %s: %v\n", addr, err)
-		} else {
-			listeners = append(listeners, ln)
-			go acceptLoop(ln, acfg, wg)
+func startServers(a *config.AtomicConfig, g *connectionGroup, acceptWG *sync.WaitGroup) []net.Listener {
+	cfg := a.Get()
+	var listeners []net.Listener
+	for _, item := range []struct{ network, addr string }{{"tcp4", net.JoinHostPort(cfg.ListenAddrIPv4, fmt.Sprint(cfg.Port))}, {"tcp6", net.JoinHostPort(cfg.ListenAddrIPv6, fmt.Sprint(cfg.Port))}, {"unix", cfg.ListenUnixSock}} {
+		if item.network == "tcp4" && cfg.ListenAddrIPv4 == "" || item.network == "tcp6" && cfg.ListenAddrIPv6 == "" || item.network == "unix" && item.addr == "" {
+			continue
 		}
-	}
-
-	if cfg.ListenAddrIPv6 != "" {
-		addr := fmt.Sprintf("[%s]:%d", cfg.ListenAddrIPv6, cfg.Port)
-		ln, err := net.Listen("tcp6", addr)
+		// Never unlink an arbitrary file or an active Unix listener.
+		ln, err := net.Listen(item.network, item.addr)
 		if err != nil {
-			errorf("Failed to listen on %s: %v\n", addr, err)
-		} else {
-			listeners = append(listeners, ln)
-			go acceptLoop(ln, acfg, wg)
+			errorf("Listen %s %s: %v\n", item.network, item.addr, err)
+			continue
 		}
+		listeners = append(listeners, ln)
+		acceptWG.Add(1)
+		go acceptLoop(ln, a, g, acceptWG)
 	}
-
-	if cfg.ListenUnixSock != "" {
-		os.Remove(cfg.ListenUnixSock)
-		ln, err := net.Listen("unix", cfg.ListenUnixSock)
-		if err != nil {
-			errorf("Failed to listen on unix %s: %v\n", cfg.ListenUnixSock, err)
-		} else {
-			listeners = append(listeners, ln)
-			go acceptLoop(ln, acfg, wg)
-		}
-	}
-
 	return listeners
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
+	configPath := config.ParseArgs()
 	setupLogger()
 	proxy.SetLogger(logWriter)
-
-	configPath := config.ParseArgs()
-
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		errorf("配置加载失败: %v\n", err)
 		os.Exit(1)
 	}
-
-	acfg := config.NewAtomicConfig(cfg)
-
+	a := config.NewAtomicConfig(cfg)
 	proxy.SetLogLevel(cfg.LogLevel)
-	proxy.UsedHandshakes = proxy.NewReplayCache(cfg.ReplayCheckLen)
-	proxy.ClientIPs = proxy.NewReplayCache(cfg.ClientIPsLen)
-
+	proxy.UsedHandshakes.Resize(cfg.ReplayCheckLen)
 	initIPInfo(cfg)
-	proxy.SetMaskHost(cfg.MaskHost)
-	currentProxyLinks := printTGInfo(cfg)
-
-	go stats.StatsPrinter(cfg, logf)
-	go proxy.GetMaskHostCertLen(cfg)
-	go proxy.ClearIPResolvingCache()
-
-	if cfg.UseMiddleProxy {
-		go proxy.UpdateMiddleProxyInfo(cfg)
+	printTGInfo(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var background sync.WaitGroup
+	for _, task := range []func(context.Context, *config.AtomicConfig){
+		func(ctx context.Context, a *config.AtomicConfig) { stats.StatsPrinter(ctx, a, logf) }, proxy.GetMaskHostCertLen, proxy.UpdateMiddleProxyInfo,
+	} {
+		background.Add(1)
+		go func() { defer background.Done(); task(ctx, a) }()
 	}
-
-	stats.StartMetricsServer(cfg, currentProxyLinks)
-
-	var wg sync.WaitGroup
-
-	listeners := startServers(acfg, &wg)
-	if len(listeners) == 0 {
-		errorf("没有可用的监听地址，退出\n")
+	metrics, err := stats.StartMetricsServer(a, buildProxyLinks, errorf)
+	if err != nil {
+		errorf("%v\n", err)
 		os.Exit(1)
 	}
-
-	reloadCh := make(chan os.Signal, 1)
-	signal.Notify(reloadCh, syscall.SIGUSR2)
-	go func() {
-		for range reloadCh {
-			newCfg, err := config.LoadConfig(configPath)
-			if err != nil {
-				errorf("配置重载失败: %v\n", err)
-				continue
-			}
-			acfg.Set(newCfg)
-			proxy.SetLogLevel(newCfg.LogLevel)
-			proxy.UsedHandshakes = proxy.NewReplayCache(newCfg.ReplayCheckLen)
-			proxy.SetMaskHost(newCfg.MaskHost)
-			currentProxyLinks = printTGInfo(newCfg)
-			infof("Config reloaded\n")
+	g := &connectionGroup{conns: make(map[net.Conn]struct{})}
+	var acceptWG sync.WaitGroup
+	listeners := startServers(a, g, &acceptWG)
+	if len(listeners) == 0 {
+		errorf("没有可用监听地址\n")
+		os.Exit(1)
+	}
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGUSR2, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	for sig := range sigCh {
+		if sig != syscall.SIGUSR2 {
+			break
 		}
-	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
+		next, err := config.LoadConfig(configPath)
+		if err == nil {
+			err = config.ValidateReload(a.Get(), next)
+		}
+		if err != nil {
+			errorf("配置重载失败: %v\n", err)
+			continue
+		}
+		proxy.UsedHandshakes.Resize(next.ReplayCheckLen)
+		a.Set(next)
+		proxy.SetLogLevel(next.LogLevel)
+		printTGInfo(next)
+		infof("Config reloaded\n")
+	}
 	infof("Shutting down...\n")
-
+	cancel()
 	for _, ln := range listeners {
 		ln.Close()
 	}
-
+	acceptWG.Wait() // No WaitGroup.Add can race with waiting for clients.
+	shutdownCtx, stop := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer stop()
+	stats.ShutdownMetrics(shutdownCtx, metrics)
 	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	go func() { g.wg.Wait(); background.Wait(); close(done) }()
 	select {
 	case <-done:
 		infof("All connections closed.\n")
-	case <-time.After(shutdownTimeout):
-		warnf("Shutdown timeout (%s), forcing exit.\n", shutdownTimeout)
+	case <-shutdownCtx.Done():
+		g.closeAll()
+		warnf("Shutdown timeout; active connections closed\n")
 	}
-
+	proxy.SetLogger(io.Discard)
 	if logFile != nil {
 		logFile.Close()
 	}
