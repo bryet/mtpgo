@@ -35,12 +35,24 @@ go build -trimpath -o mtpgo ./cmd/mtpgo
 
 ## 安装管理脚本
 
-建议下载后检查脚本，再执行：
+## ✨golang版TG代理
 
-```bash
-curl -fSL https://raw.githubusercontent.com/bryet/mtpgo/main/mtproxy.sh -o mtproxy.sh
-bash mtproxy.sh
+>适配 /386/amd64/arm64/armv7/armv6/s390x 架构
+>
+>支持ipv4和ipv6
+>
+>默认开启混淆伪装和TLS加密
+>
+>支持TG频道推广（需要TG2021年及之前的老号）
+
+## ✨一键脚本
 ```
+bash <(curl -sSL https://raw.githubusercontent.com/bryet/mtpgo/main/mtproxy.sh)
+```
+
+🟢 DOMAIN 找一个没有被墙的网站的域名
+
+🟢 TAG 从机器人 https://t.me/MTProxybot 获取
 
 脚本按 `mtproxy.example.sh` 保留彩色 0–9 菜单、端口/密钥/TAG 设置及链接展示。脚本需要 root 来安装服务，但代理进程使用专用 `mtpgo` 用户：
 
