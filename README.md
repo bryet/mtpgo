@@ -117,14 +117,15 @@ go test ./...
 go vet ./...
 CGO_ENABLED=1 go test -race ./...   # 需要 C 编译器
 bash -n mtproxy.sh
-bash tests/installer_test.sh       # 网络/账户/服务管理均 stub，不操作真实服务
-bash tests/cli_test.sh             # 离线验证版本、密钥生成和配置校验
-shellcheck -x mtproxy.sh mtpgo_openrc tests/*.sh
+bash -n mtpgo_openrc
+shellcheck mtpgo_openrc
 go test ./proxy -run '^$' -fuzz FuzzClientHello -fuzztime 10s
 go test ./proto -run '^$' -fuzz FuzzProxyProtocol -fuzztime 10s
 go test ./proto -run '^$' -fuzz FuzzFrameLength -fuzztime 10s
 ```
 
-发布前 CI 运行回归测试、race、静态检查和解析器 fuzz。手动触发 Release 流程时，版本号通过显式环境变量传入构建，写入二进制及 Release 标签。
+安装、更新、配置及服务管理统一通过 `mtproxy.sh`，不再提供 `tests/` 下的 Shell 测试脚本。CI 不执行或加载管理脚本，只对其进行 Bash 语法检查，因此不需要 root 权限。
+
+发布前 CI 保留 Go 回归测试、race、静态检查和解析器 fuzz。手动触发 Release 流程时，版本号通过显式环境变量传入构建，写入二进制及 Release 标签。
 
 许可证：GPL-3.0，见 `LICENSE`。

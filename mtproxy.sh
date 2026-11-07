@@ -257,10 +257,7 @@ Download(){
     fi
     tar xzf "mtpgo-linux-${arch}.tar.gz"
     rm -f "mtpgo-linux-${arch}.tar.gz"
-    # 初次安装从模板生成运行配置，不覆盖已存在的用户配置。
-    if [[ ! -e "$mtp_conf" ]]; then
-        cp config.example.ini "$mtp_conf" || return 1
-    fi
+    mv config.example.ini config.ini
 
     # 保存版本信息
     echo "$last_version" > "${mtp_dir}/version"
