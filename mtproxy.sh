@@ -57,7 +57,7 @@ check_arch(){
             exit 1
             ;;
     esac
-    echo "架构:${Info} ${arch}"
+    echo -e "${Info} 架构 ${arch}"
 }
 
 check_release(){
