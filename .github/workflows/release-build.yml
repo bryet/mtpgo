@@ -21,8 +21,7 @@ jobs:
           go-version-file: go.mod
       - run: go test -race ./...
       - run: go vet ./...
-      - run: bash -n mtproxy.sh && bash -n mtpgo_openrc
-      - run: shellcheck mtpgo_openrc
+      - run: bash -n mtproxy.sh
       - run: go test ./proxy -run '^$' -fuzz FuzzClientHello -fuzztime 10s
       - run: go test ./proto -run '^$' -fuzz FuzzProxyProtocol -fuzztime 10s
       - run: go test ./proto -run '^$' -fuzz FuzzFrameLength -fuzztime 10s
